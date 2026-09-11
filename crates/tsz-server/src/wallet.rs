@@ -161,7 +161,8 @@ impl RealWallet {
         )
         .map_err(|e| anyhow::anyhow!("initializing wallet database: {e}"))?;
 
-        if db.get_account_ids()?.is_empty() {
+        let account_count = db.get_account_ids()?.len();
+        if account_count == 0 || account_count == usize::from(crate::db::USER_ACCOUNT_COUNT) {
             // lightwalletd treats a BlockId with height 0 as unspecified, while the
             // SDK asks for the tree state immediately before an account birthday.
             // Start at block 2 so that the initial tree-state request is for block 1.
@@ -170,12 +171,12 @@ impl RealWallet {
                 ChainState::empty(BlockHeight::from_u32(1), BlockHash([0; 32])),
                 None,
             );
-            for id in 1..=5 {
+            for id in (account_count + 1)..=usize::from(crate::db::TREASURY_ACCOUNT_ID) {
                 db.create_account(&format!("Account {id}"), &secret, &birthday, None)?;
             }
         }
-        if db.get_account_ids()?.len() != 5 {
-            bail!("wallet database must contain exactly five accounts");
+        if db.get_account_ids()?.len() != usize::from(crate::db::TREASURY_ACCOUNT_ID) {
+            bail!("wallet database must contain exactly six accounts");
         }
         let mut accounts = db
             .get_account_ids()?
@@ -345,7 +346,13 @@ impl RealWallet {
         Ok(txid.to_string())
     }
 
-    pub async fn shield_coinbase(&self, seed_hex: &str, from: &str, to: &str) -> Result<String> {
+    pub async fn shield_coinbase(
+        &self,
+        seed_hex: &str,
+        treasury_account: u8,
+        from: &str,
+        to: &str,
+    ) -> Result<String> {
         let mut db = self.db.lock().await;
         let params = regtest_network();
         let from = match Address::decode(&params, from).context("invalid treasury address")? {
@@ -369,8 +376,16 @@ impl RealWallet {
         )
         .map_err(|e| anyhow::anyhow!("proposing coinbase shielding: {e}"))?;
         let seed = hex::decode(seed_hex)?;
-        let usk = UnifiedSpendingKey::from_seed(&params, &seed, zip32::AccountId::ZERO)
-            .map_err(|e| anyhow::anyhow!("deriving treasury key: {e:?}"))?;
+        let account_index = treasury_account
+            .checked_sub(1)
+            .context("invalid treasury account")?;
+        let usk = UnifiedSpendingKey::from_seed(
+            &params,
+            &seed,
+            zip32::AccountId::try_from(u32::from(account_index))
+                .map_err(|_| anyhow::anyhow!("invalid treasury account"))?,
+        )
+        .map_err(|e| anyhow::anyhow!("deriving treasury key: {e:?}"))?;
         let prover = LocalTxProver::bundled();
         let txids = create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
             &mut *db,

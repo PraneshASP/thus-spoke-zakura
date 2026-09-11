@@ -3,11 +3,16 @@ mod db;
 mod rpc;
 mod wallet;
 
-use std::{fs, net::SocketAddr, path::PathBuf};
+use std::{
+    fs,
+    net::SocketAddr,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use db::Store;
+use db::{Store, TREASURY_ACCOUNT_ID};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -54,12 +59,17 @@ fn init(data_dir: PathBuf, config_dir: PathBuf) -> Result<()> {
     let store = Store::open(data_dir.join("tsz.db"))?;
     store.initialize()?;
     wallet::RealWallet::open(&data_dir, &store.seed()?)?;
-    let miner = store.account(1)?.transparent_address;
-    let config = format!(
+    let miner = store.account(TREASURY_ACCOUNT_ID)?.transparent_address;
+    fs::write(config_dir.join("zakurad.toml"), zakura_config(&miner))?;
+    println!("initialized five development accounts and a hidden treasury; miner address {miner}");
+    Ok(())
+}
+
+fn zakura_config(miner: &str) -> String {
+    format!(
         r#"[network]
 network = "Regtest"
 listen_addr = "0.0.0.0:18233"
-
 [network.testnet_parameters.activation_heights]
 "NU6" = 1
 
@@ -74,10 +84,7 @@ cache_dir = "/data"
 miner_address = "{miner}"
 extra_coinbase_data = "thus-spoke-zakura"
 "#
-    );
-    fs::write(config_dir.join("zakurad.toml"), config)?;
-    println!("initialized five accounts; miner address {miner}");
-    Ok(())
+    )
 }
 
 async fn serve(data_dir: PathBuf) -> Result<()> {
@@ -91,6 +98,20 @@ async fn serve(data_dir: PathBuf) -> Result<()> {
         std::env::var("TSZ_ZAKURA_RPC").unwrap_or_else(|_| "http://127.0.0.1:18232".into()),
         std::env::var("TSZ_INSTANCE").unwrap_or_else(|_| "default".into()),
     );
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        match api::dependencies_ready(&state).await {
+            Ok(()) => break,
+            Err(error) if Instant::now() < deadline => {
+                tracing::info!(%error, "waiting for Zakura and lightwalletd");
+                tokio::time::sleep(Duration::from_millis(750)).await;
+            }
+            Err(error) => return Err(error).context("waiting for startup dependencies"),
+        }
+    }
+    api::provision_initial_balance(&state)
+        .await
+        .context("provisioning Account 1 with 5 Orchard ZEC")?;
     let app = api::router(state);
     let address: SocketAddr = std::env::var("TSZ_LISTEN")
         .unwrap_or_else(|_| "127.0.0.1:8080".into())
@@ -100,4 +121,23 @@ async fn serve(data_dir: PathBuf) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(address).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configures_the_hidden_treasury_as_miner() {
+        let store = Store::open(":memory:").unwrap();
+        store.initialize().unwrap();
+        let user = store.account(1).unwrap().transparent_address;
+        let treasury = store
+            .account(TREASURY_ACCOUNT_ID)
+            .unwrap()
+            .transparent_address;
+        let config = zakura_config(&treasury);
+        assert!(config.contains(&format!("miner_address = \"{treasury}\"")));
+        assert!(!config.contains(&format!("miner_address = \"{user}\"")));
+    }
 }
