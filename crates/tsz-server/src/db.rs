@@ -16,6 +16,8 @@ use zcash_keys::{
 use zcash_protocol::{consensus::BlockHeight, local_consensus::LocalNetwork};
 
 pub const ZATOSHIS_PER_ZEC: u64 = 100_000_000;
+pub const USER_ACCOUNT_COUNT: u8 = 5;
+pub const TREASURY_ACCOUNT_ID: u8 = 6;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Account {
@@ -69,19 +71,25 @@ impl Store {
             );
             CREATE TABLE IF NOT EXISTS idempotency (key TEXT PRIMARY KEY, activity_id TEXT NOT NULL);
         "#)?;
-        let exists: bool =
-            db.query_row("SELECT EXISTS(SELECT 1 FROM accounts)", [], |r| r.get(0))?;
-        if !exists {
+        let seed = db
+            .query_row("SELECT value FROM metadata WHERE key='seed'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .optional()?;
+        let entropy = if let Some(seed) = seed {
+            hex::decode(seed).context("invalid wallet seed")?
+        } else {
             let mut entropy = [0u8; 32];
             rand::rng().fill_bytes(&mut entropy);
             db.execute(
                 "INSERT INTO metadata(key, value) VALUES('seed', ?1)",
                 [hex::encode(entropy)],
             )?;
-            for id in 1u8..=5 {
-                let (ua, taddr) = derived_addresses(&entropy, id)?;
-                db.execute("INSERT INTO accounts(id,name,unified_address,transparent_address) VALUES(?1,?2,?3,?4)", params![id, format!("Account {id}"), ua, taddr])?;
-            }
+            entropy.to_vec()
+        };
+        for id in 1u8..=TREASURY_ACCOUNT_ID {
+            let (ua, taddr) = derived_addresses(&entropy, id)?;
+            db.execute("INSERT OR IGNORE INTO accounts(id,name,unified_address,transparent_address) VALUES(?1,?2,?3,?4)", params![id, format!("Account {id}"), ua, taddr])?;
         }
         Ok(())
     }
@@ -92,6 +100,14 @@ impl Store {
         Ok(query
             .query_map([], row_account)?
             .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn user_accounts(&self) -> Result<Vec<Account>> {
+        Ok(self
+            .accounts()?
+            .into_iter()
+            .filter(|account| account.id <= USER_ACCOUNT_COUNT)
+            .collect())
     }
 
     pub fn account(&self, id: u8) -> Result<Account> {
@@ -321,10 +337,15 @@ fn derived_addresses(seed: &[u8], id: u8) -> Result<(String, String)> {
 mod tests {
     use super::*;
     #[test]
-    fn creates_five_accounts_and_idempotent_faucet() {
+    fn creates_user_accounts_and_hidden_treasury() {
         let store = Store::open(":memory:").unwrap();
         store.initialize().unwrap();
-        assert_eq!(store.accounts().unwrap().len(), 5);
+        assert_eq!(store.accounts().unwrap().len(), 6);
+        assert_eq!(store.user_accounts().unwrap().len(), 5);
+        assert_eq!(
+            store.account(TREASURY_ACCOUNT_ID).unwrap().name,
+            "Account 6"
+        );
         assert!(
             store
                 .account(1)
@@ -340,6 +361,20 @@ mod tests {
             .unwrap();
         assert_eq!(first.id, second.id);
         assert_eq!(store.account(2).unwrap().orchard_zatoshi, 0);
+    }
+    #[test]
+    fn restores_the_hidden_treasury_for_existing_stores() {
+        let store = Store::open(":memory:").unwrap();
+        store.initialize().unwrap();
+        store
+            .0
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM accounts WHERE id=?1", [TREASURY_ACCOUNT_ID])
+            .unwrap();
+        store.initialize().unwrap();
+        assert_eq!(store.accounts().unwrap().len(), 6);
+        assert_eq!(store.user_accounts().unwrap().len(), 5);
     }
     #[test]
     fn records_real_transfer_without_mutating_balances() {

@@ -1,5 +1,6 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
+use anyhow::Context;
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
@@ -19,7 +20,7 @@ use tower_http::{
 };
 
 use crate::{
-    db::{Account, Activity, Store, ZATOSHIS_PER_ZEC},
+    db::{Account, Activity, Store, TREASURY_ACCOUNT_ID, USER_ACCOUNT_COUNT, ZATOSHIS_PER_ZEC},
     rpc::{ChainInfo, NodeRpc},
     wallet::RealWallet,
 };
@@ -73,6 +74,12 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+pub async fn dependencies_ready(state: &AppState) -> anyhow::Result<()> {
+    state.0.rpc.chain_info().await?;
+    state.0.wallet.sync().await?;
+    Ok(())
+}
+
 async fn health(State(state): State<AppState>) -> Response {
     let node = state.0.rpc.chain_info().await.ok();
     let wallet = state.0.wallet.sync().await;
@@ -100,7 +107,7 @@ async fn status(State(state): State<AppState>) -> ApiResult<Json<Status>> {
     Ok(Json(Status {
         instance: state.0.instance.clone(),
         node: state.0.rpc.chain_info().await.ok(),
-        account_count: state.0.store.accounts()?.len(),
+        account_count: state.0.store.user_accounts()?.len(),
         auto_mine: true,
         network: "Regtest",
     }))
@@ -109,6 +116,7 @@ async fn accounts(State(state): State<AppState>) -> ApiResult<Json<Vec<Account>>
     state.0.wallet.sync().await?;
     let mut accounts = state.0.store.accounts()?;
     state.0.wallet.apply_balances(&mut accounts).await?;
+    accounts.retain(|account| account.id <= USER_ACCOUNT_COUNT);
     Ok(Json(accounts))
 }
 
@@ -137,6 +145,8 @@ async fn send(
     Json(req): Json<SendRequest>,
 ) -> ApiResult<Json<Activity>> {
     require_key(&req.idempotency_key)?;
+    require_user_account(req.from_account)?;
+    require_user_account(req.to_account)?;
     if let Some(existing) = state.0.store.activity_for_key(&req.idempotency_key)? {
         return Ok(Json(existing));
     }
@@ -186,36 +196,75 @@ async fn faucet(
     Json(req): Json<FaucetRequest>,
 ) -> ApiResult<Json<Activity>> {
     require_key(&req.idempotency_key)?;
-    if let Some(existing) = state.0.store.activity_for_key(&req.idempotency_key)? {
-        return Ok(Json(existing));
-    }
+    require_user_account(req.account_id)?;
     if req.amount_zatoshi > 5 * ZATOSHIS_PER_ZEC {
         return Err(ApiError::bad_request(
             "a faucet request is limited to 5 ZEC",
         ));
     }
-    let destination = state.0.store.account(req.account_id)?;
-    let address = match req.pool.as_str() {
+    if req.amount_zatoshi == 0 {
+        return Err(ApiError::bad_request("amount must be greater than zero"));
+    }
+    if !matches!(req.pool.as_str(), "transparent" | "orchard") {
+        return Err(ApiError::bad_request("pool must be transparent or orchard"));
+    }
+    Ok(Json(
+        fund_from_treasury(
+            &state,
+            req.account_id,
+            &req.pool,
+            req.amount_zatoshi,
+            &req.idempotency_key,
+        )
+        .await?,
+    ))
+}
+
+async fn fund_from_treasury(
+    state: &AppState,
+    account_id: u8,
+    pool: &str,
+    amount_zatoshi: u64,
+    idempotency_key: &str,
+) -> anyhow::Result<Activity> {
+    if let Some(existing) = state.0.store.activity_for_key(idempotency_key)? {
+        return Ok(existing);
+    }
+    let destination = state.0.store.account(account_id)?;
+    let address = match pool {
         "transparent" => destination.transparent_address,
         "orchard" => destination.unified_address,
-        _ => return Err(ApiError::bad_request("pool must be transparent or orchard")),
+        _ => anyhow::bail!("pool must be transparent or orchard"),
     };
-    let treasury = state.0.store.account(1)?;
+    let treasury = state.0.store.account(TREASURY_ACCOUNT_ID)?;
     // The wallet starts scanning at block 2 because lightwalletd reserves height 0
     // as an unspecified BlockId. At height 102, block 2 is the first visible mature reward.
     let hashes = state.0.rpc.generate(102).await?;
     state.0.wallet.sync().await?;
-    let mature_block = state.0.rpc.block(&hashes[1]).await?;
+    let mature_hash = hashes
+        .get(1)
+        .context("Zakura did not return the expected maturity block")?;
+    let mature_block = state.0.rpc.block(mature_hash).await?;
+    let mature_height = mature_block
+        .pointer("/height")
+        .and_then(Value::as_u64)
+        .and_then(|height| u32::try_from(height).ok())
+        .context("Zakura maturity block omitted its height")?;
     let mature_tx = mature_block
         .pointer("/tx/0/hex")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("Zakura block omitted coinbase transaction hex"))?;
-    state.0.wallet.enhance_transaction(mature_tx, 2).await?;
+    state
+        .0
+        .wallet
+        .enhance_transaction(mature_tx, mature_height)
+        .await?;
     state
         .0
         .wallet
         .shield_coinbase(
             &state.0.store.seed()?,
+            TREASURY_ACCOUNT_ID,
             &treasury.transparent_address,
             &treasury.unified_address,
         )
@@ -227,20 +276,59 @@ async fn faucet(
         .wallet
         .send(
             &state.0.store.seed()?,
-            1,
+            TREASURY_ACCOUNT_ID,
             "orchard",
             &address,
-            req.amount_zatoshi,
+            amount_zatoshi,
         )
         .await?;
-    let pending = state.0.store.faucet(
-        req.account_id,
-        &req.pool,
-        req.amount_zatoshi,
-        &req.idempotency_key,
-        &txid,
+    let pending = state
+        .0
+        .store
+        .faucet(account_id, pool, amount_zatoshi, idempotency_key, &txid)?;
+    let hashes = state.0.rpc.generate(1).await?;
+    let confirmed = state.0.store.confirm(
+        &pending.id,
+        hashes.first().map(String::as_str).unwrap_or(""),
     )?;
-    Ok(Json(confirm_after_mining(&state, pending).await?))
+    state.0.wallet.sync().await?;
+    notify(state, "wallet");
+    Ok(confirmed)
+}
+
+pub async fn provision_initial_balance(state: &AppState) -> anyhow::Result<()> {
+    const INITIAL_FUNDING_KEY: &str = "startup-account-1-orchard-v1";
+    if state
+        .0
+        .store
+        .activity_for_key(INITIAL_FUNDING_KEY)?
+        .is_some()
+    {
+        state.0.wallet.sync().await?;
+        return Ok(());
+    }
+    fund_from_treasury(
+        state,
+        1,
+        "orchard",
+        5 * ZATOSHIS_PER_ZEC,
+        INITIAL_FUNDING_KEY,
+    )
+    .await?;
+    state.0.wallet.sync().await?;
+    let mut accounts = state.0.store.accounts()?;
+    state.0.wallet.apply_balances(&mut accounts).await?;
+    let account = accounts
+        .into_iter()
+        .find(|account| account.id == 1)
+        .context("Account 1 disappeared during startup provisioning")?;
+    anyhow::ensure!(
+        account.orchard_zatoshi == 5 * ZATOSHIS_PER_ZEC,
+        "Account 1 startup Orchard balance is {}, expected {} zatoshi; reset this existing instance to migrate to the hidden treasury",
+        account.orchard_zatoshi,
+        5 * ZATOSHIS_PER_ZEC
+    );
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -378,6 +466,14 @@ fn require_key(key: &str) -> ApiResult<()> {
     }
 }
 
+fn require_user_account(id: u8) -> ApiResult<()> {
+    if (1..=USER_ACCOUNT_COUNT).contains(&id) {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request("account must be between 1 and 5"))
+    }
+}
+
 type ApiResult<T> = Result<T, ApiError>;
 struct ApiError {
     status: StatusCode,
@@ -406,5 +502,18 @@ impl IntoResponse for ApiError {
             Json(json!({"error":{"message":self.message,"status":self.status.as_u16()}})),
         )
             .into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reserves_the_treasury_account_from_public_operations() {
+        for id in 1..=USER_ACCOUNT_COUNT {
+            assert!(require_user_account(id).is_ok());
+        }
+        assert!(require_user_account(TREASURY_ACCOUNT_ID).is_err());
     }
 }

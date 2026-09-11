@@ -7,7 +7,7 @@ thus-spoke-zakura
 ```
 
 The launcher creates an isolated Zakura node, lightwalletd, five development
-accounts, faucet and mining controls, and a browser-based wallet/explorer. Host
+accounts, a hidden mining treasury, faucet and mining controls, and a browser-based wallet/explorer. Host
 ports are chosen automatically and bind only to `127.0.0.1`.
 
 ## Requirements
@@ -89,8 +89,9 @@ Browser ──HTTP/SSE── tsz-server ──JSON-RPC── Zakura (Regtest)
 The Rust service uses Zakura's wallet, key, primitive, proof, and SQLite crates.
 It scans compact blocks through lightwalletd, reads balances from the scanned
 wallet database, constructs and proves real transactions, and broadcasts them
-through lightwalletd. Faucet requests mine mature coinbase funds, shield them
-through Account 1, and then make the requested transfer. The activity database
+through a hidden sixth account used as the mining and faucet treasury. On first
+startup, Account 1 receives exactly 5 ZEC in Orchard from that treasury. Faucet
+requests mine mature coinbase funds, shield them through Account 6, and then make the requested transfer. The activity database
 is a UI index only and is never a source of wallet balances.
 
 Each faucet request is limited to 5 ZEC. The regtest wallet begins scanning at
@@ -99,6 +100,11 @@ Before shielding, the service retrieves the mature coinbase transaction from
 Zakura and stores its full metadata in the wallet; this compensates for the
 compact transparent-output response not carrying a transaction index. These
 details are internal to the faucet and require no manual setup.
+
+Instances created by older releases keep Account 1 as the miner in their persisted
+Zakura configuration. Run `thus-spoke-zakura reset <name> --force` and start the
+instance again to migrate it to the hidden treasury layout. Resetting permanently
+deletes that instance's local regtest chain and wallet data.
 
 The local chain activates NU6 at height 1 and intentionally remains before
 NU6.1. Activating later upgrades at block 1 would require their consensus
