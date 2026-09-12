@@ -64,7 +64,7 @@ registry, Git, and target caches through BuildKit cache mounts.
 Every command accepts `--name <instance>`; the default name is `default`.
 
 ```text
-start [--no-open]   Start or resume an instance
+start [--no-open] [--build|--build-dev]  Start or resume; optionally rebuild images
 status              Show health and endpoints
 open                Open the dashboard
 endpoints [--json]  Print integration endpoints
@@ -73,6 +73,20 @@ stop                Stop while preserving data
 reset --force       Delete exactly one instance and its volumes
 list                List instances
 doctor              Verify Docker connectivity
+```
+
+During development, rebuild the app and lightwalletd images and recreate their
+containers without deleting instance data:
+
+```console
+cargo run -p thus-spoke-zakura -- start --build
+```
+
+For a faster edit/build/run loop, compile the Rust server without release
+optimizations:
+
+```console
+cargo run -p thus-spoke-zakura -- start --build-dev
 ```
 
 `reset --force` permanently removes the selected instance's chain, wallet,

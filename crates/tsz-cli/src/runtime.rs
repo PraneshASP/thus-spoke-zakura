@@ -86,8 +86,19 @@ impl Runtime {
         Ok(())
     }
 
-    pub fn start(&self, name: &InstanceName, no_open: bool, json: bool) -> Result<()> {
+    pub fn start(
+        &self,
+        name: &InstanceName,
+        no_open: bool,
+        build: bool,
+        build_dev: bool,
+        json: bool,
+    ) -> Result<()> {
         self.doctor(false)?;
+        if build || build_dev {
+            build_project_images(build_dev)?;
+            recreate_project_containers(&prefix(name))?;
+        }
         for image in [APP_IMAGE, ZAKURA_IMAGE, LIGHTWALLETD_IMAGE] {
             ensure_image(image)?;
         }
@@ -128,7 +139,11 @@ impl Runtime {
         }
         let endpoints = inspect_endpoints(&prefix)?;
         self.write_instance(name, &endpoints)?;
-        wait_ready(&endpoints.dashboard, Duration::from_secs(120))?;
+        wait_ready(
+            &endpoints.dashboard,
+            &format!("{prefix}-app"),
+            Duration::from_secs(120),
+        )?;
         if json {
             println!("{}", serde_json::to_string_pretty(&endpoints)?);
         } else {
@@ -423,6 +438,59 @@ fn ensure_image(image: &str) -> Result<()> {
     }
     Ok(())
 }
+fn build_project_images(dev: bool) -> Result<()> {
+    let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    if !project_root.join("Dockerfile").is_file()
+        || !project_root
+            .join("docker/lightwalletd.Dockerfile")
+            .is_file()
+    {
+        bail!(
+            "cannot build images: project source is unavailable at {}",
+            project_root.display()
+        );
+    }
+
+    if dev {
+        println!("Building {APP_IMAGE} with the Rust dev profile…");
+        docker_inherit_in(
+            &[
+                "build",
+                "--build-arg",
+                "RUST_PROFILE=dev",
+                "-t",
+                APP_IMAGE,
+                ".",
+            ],
+            &project_root,
+        )?;
+    } else {
+        println!("Building {APP_IMAGE}…");
+        docker_inherit_in(&["build", "-t", APP_IMAGE, "."], &project_root)?;
+    }
+    println!("Building {LIGHTWALLETD_IMAGE}…");
+    docker_inherit_in(
+        &[
+            "build",
+            "-f",
+            "docker/lightwalletd.Dockerfile",
+            "-t",
+            LIGHTWALLETD_IMAGE,
+            ".",
+        ],
+        &project_root,
+    )
+}
+fn recreate_project_containers(prefix: &str) -> Result<()> {
+    for service in ["app", "lightwalletd"] {
+        let target = format!("{prefix}-{service}");
+        if container_exists(&target)? {
+            println!("Recreating {target} with the new image…");
+            docker(["rm", "-f", &target])?;
+        }
+    }
+    Ok(())
+}
 fn container_running(name: &str) -> Result<bool> {
     Ok(docker_output([
         "container",
@@ -432,7 +500,7 @@ fn container_running(name: &str) -> Result<bool> {
         name,
     ])? == "true")
 }
-fn wait_ready(base: &str, timeout: Duration) -> Result<()> {
+fn wait_ready(base: &str, app_container: &str, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if Command::new("curl")
@@ -443,6 +511,11 @@ fn wait_ready(base: &str, timeout: Duration) -> Result<()> {
             .is_ok_and(|s| s.success())
         {
             return Ok(());
+        }
+        if !container_running(app_container).unwrap_or(false) {
+            let logs = docker_logs(app_container)
+                .unwrap_or_else(|error| format!("could not read app logs: {error}"));
+            bail!("app exited before becoming healthy:\n{logs}");
         }
         thread::sleep(Duration::from_millis(750));
     }
@@ -475,10 +548,18 @@ fn docker<const N: usize>(args: [&str; N]) -> Result<()> {
     docker_inherit(&args)
 }
 fn docker_inherit(args: &[&str]) -> Result<()> {
-    let status = Command::new("docker")
-        .args(args)
-        .status()
-        .context("running Docker")?;
+    docker_command(args, None)
+}
+fn docker_inherit_in(args: &[&str], current_dir: &std::path::Path) -> Result<()> {
+    docker_command(args, Some(current_dir))
+}
+fn docker_command(args: &[&str], current_dir: Option<&std::path::Path>) -> Result<()> {
+    let mut command = Command::new("docker");
+    command.args(args);
+    if let Some(current_dir) = current_dir {
+        command.current_dir(current_dir);
+    }
+    let status = command.status().context("running Docker")?;
     if !status.success() {
         bail!("docker {} failed", args.join(" "));
     }
@@ -493,6 +574,18 @@ fn docker_output<const N: usize>(args: [&str; N]) -> Result<String> {
         bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
     }
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+fn docker_logs(container: &str) -> Result<String> {
+    let output = Command::new("docker")
+        .args(["logs", "--tail", "50", container])
+        .output()
+        .context("running Docker")?;
+    if !output.status.success() {
+        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    let mut logs = output.stdout;
+    logs.extend_from_slice(&output.stderr);
+    Ok(String::from_utf8_lossy(&logs).trim().to_owned())
 }
 
 #[cfg(test)]

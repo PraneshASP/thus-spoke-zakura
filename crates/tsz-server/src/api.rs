@@ -239,8 +239,7 @@ async fn fund_from_treasury(
     let treasury = state.0.store.account(TREASURY_ACCOUNT_ID)?;
     // The wallet starts scanning at block 2 because lightwalletd reserves height 0
     // as an unspecified BlockId. At height 102, block 2 is the first visible mature reward.
-    let hashes = state.0.rpc.generate(102).await?;
-    state.0.wallet.sync().await?;
+    let hashes = mine_and_sync(state, 102).await?;
     let mature_hash = hashes
         .get(1)
         .context("Zakura did not return the expected maturity block")?;
@@ -269,8 +268,7 @@ async fn fund_from_treasury(
             &treasury.unified_address,
         )
         .await?;
-    state.0.rpc.generate(1).await?;
-    state.0.wallet.sync().await?;
+    mine_and_sync(state, 1).await?;
     let txid = state
         .0
         .wallet
@@ -286,14 +284,35 @@ async fn fund_from_treasury(
         .0
         .store
         .faucet(account_id, pool, amount_zatoshi, idempotency_key, &txid)?;
-    let hashes = state.0.rpc.generate(1).await?;
+    let hashes = mine_and_sync(state, 1).await?;
     let confirmed = state.0.store.confirm(
         &pending.id,
         hashes.first().map(String::as_str).unwrap_or(""),
     )?;
-    state.0.wallet.sync().await?;
     notify(state, "wallet");
     Ok(confirmed)
+}
+
+async fn mine_and_sync(state: &AppState, blocks: u32) -> anyhow::Result<Vec<String>> {
+    let hashes = state.0.rpc.generate(blocks).await?;
+    let tip_hash = hashes
+        .last()
+        .context("Zakura did not return the mined block hash")?;
+    let tip_height = state
+        .0
+        .rpc
+        .block(tip_hash)
+        .await?
+        .pointer("/height")
+        .and_then(Value::as_u64)
+        .context("Zakura mined block omitted its height")?;
+    state
+        .0
+        .wallet
+        .wait_for_height(tip_height, Duration::from_secs(120))
+        .await?;
+    state.0.wallet.sync().await?;
+    Ok(hashes)
 }
 
 pub async fn provision_initial_balance(state: &AppState) -> anyhow::Result<()> {
