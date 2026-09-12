@@ -139,7 +139,11 @@ impl Runtime {
         }
         let endpoints = inspect_endpoints(&prefix)?;
         self.write_instance(name, &endpoints)?;
-        wait_ready(&endpoints.dashboard, Duration::from_secs(120))?;
+        wait_ready(
+            &endpoints.dashboard,
+            &format!("{prefix}-app"),
+            Duration::from_secs(120),
+        )?;
         if json {
             println!("{}", serde_json::to_string_pretty(&endpoints)?);
         } else {
@@ -496,7 +500,7 @@ fn container_running(name: &str) -> Result<bool> {
         name,
     ])? == "true")
 }
-fn wait_ready(base: &str, timeout: Duration) -> Result<()> {
+fn wait_ready(base: &str, app_container: &str, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if Command::new("curl")
@@ -507,6 +511,11 @@ fn wait_ready(base: &str, timeout: Duration) -> Result<()> {
             .is_ok_and(|s| s.success())
         {
             return Ok(());
+        }
+        if !container_running(app_container).unwrap_or(false) {
+            let logs = docker_logs(app_container)
+                .unwrap_or_else(|error| format!("could not read app logs: {error}"));
+            bail!("app exited before becoming healthy:\n{logs}");
         }
         thread::sleep(Duration::from_millis(750));
     }
@@ -565,6 +574,18 @@ fn docker_output<const N: usize>(args: [&str; N]) -> Result<String> {
         bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
     }
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+fn docker_logs(container: &str) -> Result<String> {
+    let output = Command::new("docker")
+        .args(["logs", "--tail", "50", container])
+        .output()
+        .context("running Docker")?;
+    if !output.status.success() {
+        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    let mut logs = output.stdout;
+    logs.extend_from_slice(&output.stderr);
+    Ok(String::from_utf8_lossy(&logs).trim().to_owned())
 }
 
 #[cfg(test)]

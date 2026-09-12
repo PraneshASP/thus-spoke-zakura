@@ -4,6 +4,7 @@ use std::{
     io,
     path::Path,
     sync::{Arc, Mutex as StdMutex},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -24,7 +25,10 @@ use zcash_client_backend::{
     },
     fees::{DustOutputPolicy, StandardFeeRule, standard::SingleOutputChangeStrategy},
     proto::service::compact_tx_streamer_client::CompactTxStreamerClient,
-    proto::{compact_formats::CompactBlock, service::RawTransaction},
+    proto::{
+        compact_formats::CompactBlock,
+        service::{ChainSpec, RawTransaction},
+    },
     sync,
     wallet::OvkPolicy,
 };
@@ -205,6 +209,28 @@ impl RealWallet {
         sync::run(&mut client, &regtest_network(), &cache, &mut *db, 100)
             .await
             .map_err(|e| anyhow::anyhow!("wallet sync failed: {e}"))
+    }
+
+    pub async fn wait_for_height(&self, target: u64, timeout: Duration) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        let mut client = CompactTxStreamerClient::connect(self.lightwalletd.clone()).await?;
+        loop {
+            let indexed = client
+                .get_latest_block(ChainSpec::default())
+                .await?
+                .into_inner()
+                .height;
+            if indexed >= target {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "lightwalletd did not index Zakura height {target} within {} seconds (latest indexed height: {indexed})",
+                    timeout.as_secs()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
     }
 
     pub async fn apply_balances(&self, accounts: &mut [Account]) -> Result<()> {
