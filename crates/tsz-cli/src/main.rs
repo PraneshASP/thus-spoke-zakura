@@ -29,6 +29,9 @@ enum Command {
     Start {
         #[arg(long)]
         no_open: bool,
+        /// Build project images from the current source before starting.
+        #[arg(long)]
+        build: bool,
     },
     /// Show service and endpoint status.
     Status,
@@ -59,8 +62,11 @@ enum Command {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let runtime = Runtime::discover()?;
-    match cli.command.unwrap_or(Command::Start { no_open: false }) {
-        Command::Start { no_open } => runtime.start(&cli.name, no_open, cli.json),
+    match cli.command.unwrap_or(Command::Start {
+        no_open: false,
+        build: false,
+    }) {
+        Command::Start { no_open, build } => runtime.start(&cli.name, no_open, build, cli.json),
         Command::Status => runtime.status(&cli.name, cli.json),
         Command::Open => runtime.open(&cli.name),
         Command::Endpoints => runtime.endpoints(&cli.name, cli.json),

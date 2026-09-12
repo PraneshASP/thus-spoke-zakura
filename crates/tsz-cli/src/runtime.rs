@@ -86,8 +86,12 @@ impl Runtime {
         Ok(())
     }
 
-    pub fn start(&self, name: &InstanceName, no_open: bool, json: bool) -> Result<()> {
+    pub fn start(&self, name: &InstanceName, no_open: bool, build: bool, json: bool) -> Result<()> {
         self.doctor(false)?;
+        if build {
+            build_project_images()?;
+            recreate_project_containers(&prefix(name))?;
+        }
         for image in [APP_IMAGE, ZAKURA_IMAGE, LIGHTWALLETD_IMAGE] {
             ensure_image(image)?;
         }
@@ -423,6 +427,44 @@ fn ensure_image(image: &str) -> Result<()> {
     }
     Ok(())
 }
+fn build_project_images() -> Result<()> {
+    let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    if !project_root.join("Dockerfile").is_file()
+        || !project_root
+            .join("docker/lightwalletd.Dockerfile")
+            .is_file()
+    {
+        bail!(
+            "cannot build images: project source is unavailable at {}",
+            project_root.display()
+        );
+    }
+
+    println!("Building {APP_IMAGE}…");
+    docker_inherit_in(&["build", "-t", APP_IMAGE, "."], &project_root)?;
+    println!("Building {LIGHTWALLETD_IMAGE}…");
+    docker_inherit_in(
+        &[
+            "build",
+            "-f",
+            "docker/lightwalletd.Dockerfile",
+            "-t",
+            LIGHTWALLETD_IMAGE,
+            ".",
+        ],
+        &project_root,
+    )
+}
+fn recreate_project_containers(prefix: &str) -> Result<()> {
+    for service in ["app", "lightwalletd"] {
+        let target = format!("{prefix}-{service}");
+        if container_exists(&target)? {
+            println!("Recreating {target} with the new image…");
+            docker(["rm", "-f", &target])?;
+        }
+    }
+    Ok(())
+}
 fn container_running(name: &str) -> Result<bool> {
     Ok(docker_output([
         "container",
@@ -475,10 +517,18 @@ fn docker<const N: usize>(args: [&str; N]) -> Result<()> {
     docker_inherit(&args)
 }
 fn docker_inherit(args: &[&str]) -> Result<()> {
-    let status = Command::new("docker")
-        .args(args)
-        .status()
-        .context("running Docker")?;
+    docker_command(args, None)
+}
+fn docker_inherit_in(args: &[&str], current_dir: &std::path::Path) -> Result<()> {
+    docker_command(args, Some(current_dir))
+}
+fn docker_command(args: &[&str], current_dir: Option<&std::path::Path>) -> Result<()> {
+    let mut command = Command::new("docker");
+    command.args(args);
+    if let Some(current_dir) = current_dir {
+        command.current_dir(current_dir);
+    }
+    let status = command.status().context("running Docker")?;
     if !status.success() {
         bail!("docker {} failed", args.join(" "));
     }

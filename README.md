@@ -64,7 +64,7 @@ registry, Git, and target caches through BuildKit cache mounts.
 Every command accepts `--name <instance>`; the default name is `default`.
 
 ```text
-start [--no-open]   Start or resume an instance
+start [--no-open] [--build]  Start or resume an instance; optionally rebuild local images
 status              Show health and endpoints
 open                Open the dashboard
 endpoints [--json]  Print integration endpoints
@@ -73,6 +73,13 @@ stop                Stop while preserving data
 reset --force       Delete exactly one instance and its volumes
 list                List instances
 doctor              Verify Docker connectivity
+```
+
+During development, rebuild the app and lightwalletd images and recreate their
+containers without deleting instance data:
+
+```console
+cargo run -p thus-spoke-zakura -- start --build
 ```
 
 `reset --force` permanently removes the selected instance's chain, wallet,
