@@ -82,8 +82,9 @@ containers without deleting instance data:
 cargo run -p thus-spoke-zakura -- start --build
 ```
 
-For a faster edit/build/run loop, compile the Rust server without release
-optimizations:
+For a faster edit/build/run loop, compile the workspace code without release
+optimizations or LTO while keeping third-party dependencies optimized for
+usable cryptographic proving performance:
 
 ```console
 cargo run -p thus-spoke-zakura -- start --build-dev

@@ -35,6 +35,14 @@ lto = true
 codegen-units = 1
 strip = true
 
+# Keep workspace crates quick to rebuild and easy to debug while avoiding
+# prohibitively slow cryptographic proving in unoptimized dependencies.
+[profile.dev-runtime]
+inherits = "dev"
+
+[profile.dev-runtime.package."*"]
+opt-level = 3
+
 # rc5's published manifest resolves zakura-pczt rc3, but the published rc3 is
 # missing the transaction extractor API used by rc5's migrations. Keep the
 # package name/version while sourcing the matching upstream revision.

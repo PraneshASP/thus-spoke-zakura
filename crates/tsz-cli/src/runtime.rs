@@ -452,12 +452,12 @@ fn build_project_images(dev: bool) -> Result<()> {
     }
 
     if dev {
-        println!("Building {APP_IMAGE} with the Rust dev profile…");
+        println!("Building {APP_IMAGE} with the Rust development profile…");
         docker_inherit_in(
             &[
                 "build",
                 "--build-arg",
-                "RUST_PROFILE=dev",
+                "RUST_PROFILE=dev-runtime",
                 "-t",
                 APP_IMAGE,
                 ".",

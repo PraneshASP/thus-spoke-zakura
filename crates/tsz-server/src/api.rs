@@ -25,6 +25,8 @@ use crate::{
     wallet::RealWallet,
 };
 
+const MINIMUM_FEE_ZATOSHI: u64 = 10_000;
+
 #[derive(Clone)]
 pub struct AppState(Arc<Inner>);
 struct Inner {
@@ -237,6 +239,46 @@ async fn fund_from_treasury(
         _ => anyhow::bail!("pool must be transparent or orchard"),
     };
     let treasury = state.0.store.account(TREASURY_ACCOUNT_ID)?;
+    state.0.wallet.sync().await?;
+    let mut accounts = state.0.store.accounts()?;
+    state.0.wallet.apply_balances(&mut accounts).await?;
+    let treasury_orchard = accounts
+        .into_iter()
+        .find(|account| account.id == TREASURY_ACCOUNT_ID)
+        .context("treasury account disappeared")?
+        .orchard_zatoshi;
+    if treasury_needs_replenishment(treasury_orchard, amount_zatoshi) {
+        replenish_treasury(state, &treasury).await?;
+    }
+    let txid = state
+        .0
+        .wallet
+        .send(
+            &state.0.store.seed()?,
+            TREASURY_ACCOUNT_ID,
+            "orchard",
+            &address,
+            amount_zatoshi,
+        )
+        .await?;
+    let pending = state
+        .0
+        .store
+        .faucet(account_id, pool, amount_zatoshi, idempotency_key, &txid)?;
+    let hashes = mine_and_sync(state, 1).await?;
+    let confirmed = state.0.store.confirm(
+        &pending.id,
+        hashes.first().map(String::as_str).unwrap_or(""),
+    )?;
+    notify(state, "wallet");
+    Ok(confirmed)
+}
+
+fn treasury_needs_replenishment(balance: u64, amount: u64) -> bool {
+    balance < amount.saturating_add(MINIMUM_FEE_ZATOSHI)
+}
+
+async fn replenish_treasury(state: &AppState, treasury: &Account) -> anyhow::Result<()> {
     // The wallet starts scanning at block 2 because lightwalletd reserves height 0
     // as an unspecified BlockId. At height 102, block 2 is the first visible mature reward.
     let hashes = mine_and_sync(state, 102).await?;
@@ -269,28 +311,7 @@ async fn fund_from_treasury(
         )
         .await?;
     mine_and_sync(state, 1).await?;
-    let txid = state
-        .0
-        .wallet
-        .send(
-            &state.0.store.seed()?,
-            TREASURY_ACCOUNT_ID,
-            "orchard",
-            &address,
-            amount_zatoshi,
-        )
-        .await?;
-    let pending = state
-        .0
-        .store
-        .faucet(account_id, pool, amount_zatoshi, idempotency_key, &txid)?;
-    let hashes = mine_and_sync(state, 1).await?;
-    let confirmed = state.0.store.confirm(
-        &pending.id,
-        hashes.first().map(String::as_str).unwrap_or(""),
-    )?;
-    notify(state, "wallet");
-    Ok(confirmed)
+    Ok(())
 }
 
 async fn mine_and_sync(state: &AppState, blocks: u32) -> anyhow::Result<Vec<String>> {
@@ -534,5 +555,12 @@ mod tests {
             assert!(require_user_account(id).is_ok());
         }
         assert!(require_user_account(TREASURY_ACCOUNT_ID).is_err());
+    }
+
+    #[test]
+    fn replenishes_treasury_only_when_amount_and_fee_are_unavailable() {
+        assert!(treasury_needs_replenishment(10_009, 10));
+        assert!(!treasury_needs_replenishment(10_010, 10));
+        assert!(treasury_needs_replenishment(u64::MAX - 1, u64::MAX));
     }
 }
