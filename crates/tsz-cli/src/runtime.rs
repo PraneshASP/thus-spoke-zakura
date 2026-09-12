@@ -86,10 +86,17 @@ impl Runtime {
         Ok(())
     }
 
-    pub fn start(&self, name: &InstanceName, no_open: bool, build: bool, json: bool) -> Result<()> {
+    pub fn start(
+        &self,
+        name: &InstanceName,
+        no_open: bool,
+        build: bool,
+        build_dev: bool,
+        json: bool,
+    ) -> Result<()> {
         self.doctor(false)?;
-        if build {
-            build_project_images()?;
+        if build || build_dev {
+            build_project_images(build_dev)?;
             recreate_project_containers(&prefix(name))?;
         }
         for image in [APP_IMAGE, ZAKURA_IMAGE, LIGHTWALLETD_IMAGE] {
@@ -427,7 +434,7 @@ fn ensure_image(image: &str) -> Result<()> {
     }
     Ok(())
 }
-fn build_project_images() -> Result<()> {
+fn build_project_images(dev: bool) -> Result<()> {
     let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     if !project_root.join("Dockerfile").is_file()
         || !project_root
@@ -440,8 +447,23 @@ fn build_project_images() -> Result<()> {
         );
     }
 
-    println!("Building {APP_IMAGE}…");
-    docker_inherit_in(&["build", "-t", APP_IMAGE, "."], &project_root)?;
+    if dev {
+        println!("Building {APP_IMAGE} with the Rust dev profile…");
+        docker_inherit_in(
+            &[
+                "build",
+                "--build-arg",
+                "RUST_PROFILE=dev",
+                "-t",
+                APP_IMAGE,
+                ".",
+            ],
+            &project_root,
+        )?;
+    } else {
+        println!("Building {APP_IMAGE}…");
+        docker_inherit_in(&["build", "-t", APP_IMAGE, "."], &project_root)?;
+    }
     println!("Building {LIGHTWALLETD_IMAGE}…");
     docker_inherit_in(
         &[

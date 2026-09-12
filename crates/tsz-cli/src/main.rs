@@ -32,6 +32,9 @@ enum Command {
         /// Build project images from the current source before starting.
         #[arg(long)]
         build: bool,
+        /// Build project images with an unoptimized Rust server before starting.
+        #[arg(long, conflicts_with = "build")]
+        build_dev: bool,
     },
     /// Show service and endpoint status.
     Status,
@@ -65,8 +68,13 @@ fn main() -> Result<()> {
     match cli.command.unwrap_or(Command::Start {
         no_open: false,
         build: false,
+        build_dev: false,
     }) {
-        Command::Start { no_open, build } => runtime.start(&cli.name, no_open, build, cli.json),
+        Command::Start {
+            no_open,
+            build,
+            build_dev,
+        } => runtime.start(&cli.name, no_open, build, build_dev, cli.json),
         Command::Status => runtime.status(&cli.name, cli.json),
         Command::Open => runtime.open(&cli.name),
         Command::Endpoints => runtime.endpoints(&cli.name, cli.json),
