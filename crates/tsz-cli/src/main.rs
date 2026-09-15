@@ -25,7 +25,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Start or resume an environment.
+    /// Start an environment in the foreground; interrupting removes its containers.
     Start {
         #[arg(long)]
         no_open: bool,

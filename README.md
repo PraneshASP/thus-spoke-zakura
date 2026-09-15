@@ -64,7 +64,7 @@ registry, Git, and target caches through BuildKit cache mounts.
 Every command accepts `--name <instance>`; the default name is `default`.
 
 ```text
-start [--no-open] [--build|--build-dev]  Start or resume; optionally rebuild images
+start [--no-open] [--build|--build-dev]  Run in foreground; optionally rebuild images
 status              Show health and endpoints
 open                Open the dashboard
 endpoints [--json]  Print integration endpoints
@@ -89,6 +89,11 @@ usable cryptographic proving performance:
 ```console
 cargo run -p thus-spoke-zakura -- start --build-dev
 ```
+
+`start` keeps control of the terminal after the environment becomes ready.
+Press Ctrl+C (or send the platform's termination signal) to stop and remove the
+selected instance's service containers. Its chain, wallet, seed, and index data
+remain available for the next run.
 
 `reset --force` permanently removes the selected instance's chain, wallet,
 seed, and index volumes. No command binds services beyond loopback.

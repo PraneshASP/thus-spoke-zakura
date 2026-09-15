@@ -8,7 +8,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+ctrlc.workspace = true
 directories.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-

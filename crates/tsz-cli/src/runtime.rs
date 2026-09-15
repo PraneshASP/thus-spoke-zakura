@@ -4,6 +4,7 @@ use std::{
     path::PathBuf,
     process::{Command, Stdio},
     str::FromStr,
+    sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
@@ -152,6 +153,10 @@ impl Runtime {
         if !no_open {
             open_url(&endpoints.dashboard)?;
         }
+        wait_for_shutdown()?;
+        println!("\nStopping {name} and removing its service containers…");
+        remove_service_containers(&prefix)?;
+        println!("Stopped {name}; its data is preserved.");
         Ok(())
     }
 
@@ -490,6 +495,38 @@ fn recreate_project_containers(prefix: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+fn remove_service_containers(prefix: &str) -> Result<()> {
+    let mut failures = Vec::new();
+    for service in ["app", "lightwalletd", "zakura"] {
+        let target = format!("{prefix}-{service}");
+        match container_exists(&target) {
+            Ok(true) => {
+                if let Err(error) = docker(["rm", "-f", &target]) {
+                    failures.push(format!("{target}: {error}"));
+                }
+            }
+            Ok(false) => {}
+            Err(error) => failures.push(format!("{target}: {error}")),
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "could not remove every service container: {}",
+            failures.join("; ")
+        )
+    }
+}
+fn wait_for_shutdown() -> Result<()> {
+    let (sender, receiver) = mpsc::channel();
+    ctrlc::set_handler(move || {
+        let _ = sender.send(());
+    })
+    .context("installing the shutdown signal handler")?;
+    println!("\nPress Ctrl+C to stop and remove this instance's service containers.");
+    receiver.recv().context("waiting for a shutdown signal")
 }
 fn container_running(name: &str) -> Result<bool> {
     Ok(docker_output([
