@@ -69,14 +69,14 @@ status              Show health and endpoints
 open                Open the dashboard
 endpoints [--json]  Print integration endpoints
 logs [service] -f   Follow app, zakura, or lightwalletd logs
-stop                Stop while preserving data
+stop                Stop and delete the selected environment
 reset --force       Delete exactly one instance and its volumes
 list                List instances
 doctor              Verify Docker connectivity
 ```
 
-During development, rebuild the app and lightwalletd images and recreate their
-containers without deleting instance data:
+During development, rebuild the app and lightwalletd images before starting a
+fresh environment:
 
 ```console
 cargo run -p thus-spoke-zakura -- start --build
@@ -90,10 +90,11 @@ usable cryptographic proving performance:
 cargo run -p thus-spoke-zakura -- start --build-dev
 ```
 
-`start` keeps control of the terminal after the environment becomes ready.
-Press Ctrl+C (or send the platform's termination signal) to stop and remove the
-selected instance's service containers. Its chain, wallet, seed, and index data
-remain available for the next run.
+Every `start` creates a fresh development environment, deleting any previous
+state for the selected instance first. It keeps control of the terminal after
+the environment becomes ready. Press Ctrl+C (or send the platform's termination
+signal) to remove its containers, volumes, network, chain, wallet, seed, index,
+configuration, and local metadata.
 
 `reset --force` permanently removes the selected instance's chain, wallet,
 seed, and index volumes. No command binds services beyond loopback.
@@ -120,11 +121,6 @@ Before shielding, the service retrieves the mature coinbase transaction from
 Zakura and stores its full metadata in the wallet; this compensates for the
 compact transparent-output response not carrying a transaction index. These
 details are internal to the faucet and require no manual setup.
-
-Instances created by older releases keep Account 1 as the miner in their persisted
-Zakura configuration. Run `thus-spoke-zakura reset <name> --force` and start the
-instance again to migrate it to the hidden treasury layout. Resetting permanently
-deletes that instance's local regtest chain and wallet data.
 
 The local chain activates NU6 at height 1 and intentionally remains before
 NU6.1. Activating later upgrades at block 1 would require their consensus
