@@ -98,11 +98,12 @@ impl Runtime {
         self.doctor(false)?;
         if build || build_dev {
             build_project_images(build_dev)?;
-            recreate_project_containers(&prefix(name))?;
         }
         for image in [APP_IMAGE, ZAKURA_IMAGE, LIGHTWALLETD_IMAGE] {
             ensure_image(image)?;
         }
+        println!("Preparing a fresh {name} environment…");
+        self.delete_instance_resources(name)?;
         fs::create_dir_all(self.instance_dir(name))?;
         let prefix = prefix(name);
         ensure_network(&prefix)?;
@@ -154,9 +155,9 @@ impl Runtime {
             open_url(&endpoints.dashboard)?;
         }
         wait_for_shutdown()?;
-        println!("\nStopping {name} and removing its service containers…");
-        remove_service_containers(&prefix)?;
-        println!("Stopped {name}; its data is preserved.");
+        println!("\nStopping and deleting {name}…");
+        self.delete_instance_resources(name)?;
+        println!("Deleted {name} and all of its development data.");
         Ok(())
     }
 
@@ -204,13 +205,8 @@ impl Runtime {
     }
 
     pub fn stop(&self, name: &InstanceName) -> Result<()> {
-        let prefix = prefix(name);
-        for service in ["app", "lightwalletd", "zakura"] {
-            if container_exists(&format!("{prefix}-{service}"))? {
-                docker(["stop", &format!("{prefix}-{service}")])?;
-            }
-        }
-        println!("Stopped {name}; its data is preserved.");
+        self.delete_instance_resources(name)?;
+        println!("Stopped and deleted {name} and all of its development data.");
         Ok(())
     }
 
@@ -218,21 +214,7 @@ impl Runtime {
         if !force {
             bail!("reset deletes chain, wallet, and seed data; repeat with --force");
         }
-        let prefix = prefix(name);
-        for service in ["app", "lightwalletd", "zakura", "init"] {
-            let target = format!("{prefix}-{service}");
-            if container_exists(&target)? {
-                docker(["rm", "-f", &target])?;
-            }
-        }
-        for suffix in ["chain", "wallet", "lightwalletd", "config"] {
-            let _ = docker(["volume", "rm", &format!("{prefix}-{suffix}")]);
-        }
-        let _ = docker(["network", "rm", &prefix]);
-        let dir = self.instance_dir(name);
-        if dir.exists() {
-            fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;
-        }
+        self.delete_instance_resources(name)?;
         println!("Deleted {name}; its Docker volumes cannot be recovered.");
         Ok(())
     }
@@ -280,6 +262,50 @@ impl Runtime {
             &fs::read(&path).with_context(|| format!("instance {name} does not exist"))?,
         )
         .context("invalid instance metadata")
+    }
+
+    fn delete_instance_resources(&self, name: &InstanceName) -> Result<()> {
+        let prefix = prefix(name);
+        let mut failures = Vec::new();
+        for service in ["app", "lightwalletd", "zakura", "init"] {
+            let target = format!("{prefix}-{service}");
+            match container_exists(&target) {
+                Ok(true) => {
+                    if let Err(error) = docker(["rm", "-f", &target]) {
+                        failures.push(format!("container {target}: {error}"));
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => failures.push(format!("container {target}: {error}")),
+            }
+        }
+        for suffix in ["chain", "wallet", "lightwalletd", "config"] {
+            let volume = format!("{prefix}-{suffix}");
+            if docker_output(["volume", "inspect", &volume]).is_ok()
+                && let Err(error) = docker(["volume", "rm", &volume])
+            {
+                failures.push(format!("volume {volume}: {error}"));
+            }
+        }
+        if docker_output(["network", "inspect", &prefix]).is_ok()
+            && let Err(error) = docker(["network", "rm", &prefix])
+        {
+            failures.push(format!("network {prefix}: {error}"));
+        }
+        let dir = self.instance_dir(name);
+        if dir.exists()
+            && let Err(error) = fs::remove_dir_all(&dir)
+        {
+            failures.push(format!("metadata {}: {error}", dir.display()));
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            bail!(
+                "could not delete every instance resource: {}",
+                failures.join("; ")
+            )
+        }
     }
 }
 
@@ -486,46 +512,13 @@ fn build_project_images(dev: bool) -> Result<()> {
         &project_root,
     )
 }
-fn recreate_project_containers(prefix: &str) -> Result<()> {
-    for service in ["app", "lightwalletd"] {
-        let target = format!("{prefix}-{service}");
-        if container_exists(&target)? {
-            println!("Recreating {target} with the new image…");
-            docker(["rm", "-f", &target])?;
-        }
-    }
-    Ok(())
-}
-fn remove_service_containers(prefix: &str) -> Result<()> {
-    let mut failures = Vec::new();
-    for service in ["app", "lightwalletd", "zakura"] {
-        let target = format!("{prefix}-{service}");
-        match container_exists(&target) {
-            Ok(true) => {
-                if let Err(error) = docker(["rm", "-f", &target]) {
-                    failures.push(format!("{target}: {error}"));
-                }
-            }
-            Ok(false) => {}
-            Err(error) => failures.push(format!("{target}: {error}")),
-        }
-    }
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        bail!(
-            "could not remove every service container: {}",
-            failures.join("; ")
-        )
-    }
-}
 fn wait_for_shutdown() -> Result<()> {
     let (sender, receiver) = mpsc::channel();
     ctrlc::set_handler(move || {
         let _ = sender.send(());
     })
     .context("installing the shutdown signal handler")?;
-    println!("\nPress Ctrl+C to stop and remove this instance's service containers.");
+    println!("\nPress Ctrl+C to stop and delete this development environment.");
     receiver.recv().context("waiting for a shutdown signal")
 }
 fn container_running(name: &str) -> Result<bool> {

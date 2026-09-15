@@ -49,7 +49,7 @@ enum Command {
         #[arg(short, long)]
         follow: bool,
     },
-    /// Stop an environment without deleting its data.
+    /// Stop and delete an environment.
     Stop,
     /// Delete one environment and all of its volumes.
     Reset {
