@@ -1,0 +1,52 @@
+name: Publish release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  promote-images:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Validate release tag
+        shell: bash
+        run: |
+          [[ "${{ github.event.release.tag_name }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Promote immutable images to latest
+        shell: bash
+        run: |
+          version="${{ github.event.release.tag_name }}"
+          version="${version#v}"
+          for image in thus-spoke-zakura-app thus-spoke-zakura-lightwalletd; do
+            docker buildx imagetools inspect "ghcr.io/zcashlabs/$image:$version"
+            docker buildx imagetools create \
+              --tag "ghcr.io/zcashlabs/$image:latest" \
+              "ghcr.io/zcashlabs/$image:$version"
+          done
+
+  public-smoke-test:
+    needs: promote-images
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install anonymously and pull exact images
+        env:
+          TSZ_VERSION: ${{ github.event.release.tag_name }}
+          TSZ_INSTALL_DIR: ${{ runner.temp }}/bin
+        shell: bash
+        run: |
+          docker logout ghcr.io || true
+          installer="https://raw.githubusercontent.com/zcashlabs/thus-spoke-zakura/${{ github.event.release.tag_name }}/install.sh"
+          curl --proto '=https' --tlsv1.2 -fsSL "$installer" | sh
+          curl --proto '=https' --tlsv1.2 -fsSL "$installer" \
+            | TSZ_VERSION=latest TSZ_SKIP_IMAGE_PULL=1 sh
+          "$TSZ_INSTALL_DIR/thus-spoke-zakura" --version

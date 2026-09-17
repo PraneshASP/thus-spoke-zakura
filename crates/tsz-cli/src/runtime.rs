@@ -13,9 +13,20 @@ use anyhow::{Context, Result, anyhow, bail};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
-const APP_IMAGE: &str = "ghcr.io/zakura-core/thus-spoke-zakura-app:0.1.0";
+const APP_IMAGE_REPOSITORY: &str = "ghcr.io/zcashlabs/thus-spoke-zakura-app";
 const ZAKURA_IMAGE: &str = "zakuracore/zakura:1.2.0";
-const LIGHTWALLETD_IMAGE: &str = "ghcr.io/zakura-core/thus-spoke-zakura-lightwalletd:0.1.0";
+const LIGHTWALLETD_IMAGE_REPOSITORY: &str = "ghcr.io/zcashlabs/thus-spoke-zakura-lightwalletd";
+
+fn app_image() -> String {
+    format!("{APP_IMAGE_REPOSITORY}:{}", env!("CARGO_PKG_VERSION"))
+}
+
+fn lightwalletd_image() -> String {
+    format!(
+        "{LIGHTWALLETD_IMAGE_REPOSITORY}:{}",
+        env!("CARGO_PKG_VERSION")
+    )
+}
 
 #[derive(Clone, Debug)]
 pub struct InstanceName(String);
@@ -95,10 +106,20 @@ impl Runtime {
         Ok(())
     }
 
+    pub fn pull(&self) -> Result<()> {
+        self.doctor(false)?;
+        for image in [app_image(), lightwalletd_image(), ZAKURA_IMAGE.to_owned()] {
+            println!("Pulling {image}…");
+            docker(["pull", &image])?;
+        }
+        println!("Runtime images are ready.");
+        Ok(())
+    }
+
     pub fn start(&self, name: &InstanceName, no_open: bool, json: bool) -> Result<()> {
         self.doctor(false)?;
-        for image in [APP_IMAGE, ZAKURA_IMAGE, LIGHTWALLETD_IMAGE] {
-            require_image(image)?;
+        for image in [app_image(), lightwalletd_image(), ZAKURA_IMAGE.to_owned()] {
+            require_image(&image)?;
         }
         println!("Preparing a fresh {name} environment…");
         self.delete_instance_resources(name)?;
@@ -121,7 +142,7 @@ impl Runtime {
                 &format!("{prefix}-wallet:/data"),
                 "-v",
                 &format!("{prefix}-config:/config"),
-                APP_IMAGE,
+                &app_image(),
                 "init",
                 "--data-dir",
                 "/data",
@@ -360,6 +381,7 @@ fn ensure_zakura(prefix: &str, name: &InstanceName) -> Result<()> {
 fn ensure_lightwalletd(prefix: &str, name: &InstanceName) -> Result<()> {
     let target = format!("{prefix}-lightwalletd");
     if !container_exists(&target)? {
+        let image = lightwalletd_image();
         docker([
             "create",
             "--name",
@@ -376,7 +398,7 @@ fn ensure_lightwalletd(prefix: &str, name: &InstanceName) -> Result<()> {
             "127.0.0.1::9067",
             "-v",
             &format!("{prefix}-lightwalletd:/var/lib/lightwalletd"),
-            LIGHTWALLETD_IMAGE,
+            &image,
             "--no-tls-very-insecure",
             "--grpc-bind-addr",
             "0.0.0.0:9067",
@@ -411,6 +433,7 @@ fn ensure_app(prefix: &str, name: &InstanceName) -> Result<()> {
             "127.0.0.1:{}",
             published_port(&format!("{prefix}-zakura"), "18233/tcp")?
         );
+        let image = app_image();
         docker([
             "create",
             "--name",
@@ -437,7 +460,7 @@ fn ensure_app(prefix: &str, name: &InstanceName) -> Result<()> {
             &format!("TSZ_PUBLIC_P2P={public_p2p}"),
             "-v",
             &format!("{prefix}-wallet:/data"),
-            APP_IMAGE,
+            &image,
             "serve",
             "--data-dir",
             "/data",
@@ -488,7 +511,9 @@ fn ensure_image(image: &str) -> Result<()> {
 }
 fn require_image(image: &str) -> Result<()> {
     if docker_output(["image", "inspect", image]).is_err() {
-        bail!("required image {image} is unavailable; run `thus-spoke-zakura build` first");
+        bail!(
+            "required image {image} is unavailable; run `thus-spoke-zakura pull` (or `thus-spoke-zakura build` from a source checkout) first"
+        );
     }
     Ok(())
 }
@@ -505,31 +530,33 @@ fn build_project_images(dev: bool) -> Result<()> {
         );
     }
 
+    let app_image = app_image();
+    let lightwalletd_image = lightwalletd_image();
     if dev {
-        println!("Building {APP_IMAGE} with the Rust development profile…");
+        println!("Building {app_image} with the Rust development profile…");
         docker_inherit_in(
             &[
                 "build",
                 "--build-arg",
                 "RUST_PROFILE=dev-runtime",
                 "-t",
-                APP_IMAGE,
+                &app_image,
                 ".",
             ],
             &project_root,
         )?;
     } else {
-        println!("Building {APP_IMAGE}…");
-        docker_inherit_in(&["build", "-t", APP_IMAGE, "."], &project_root)?;
+        println!("Building {app_image}…");
+        docker_inherit_in(&["build", "-t", &app_image, "."], &project_root)?;
     }
-    println!("Building {LIGHTWALLETD_IMAGE}…");
+    println!("Building {lightwalletd_image}…");
     docker_inherit_in(
         &[
             "build",
             "-f",
             "docker/lightwalletd.Dockerfile",
             "-t",
-            LIGHTWALLETD_IMAGE,
+            &lightwalletd_image,
             ".",
         ],
         &project_root,
@@ -652,5 +679,23 @@ mod tests {
         for invalid in ["", "UPPER", "with space", "-start", "end-"] {
             assert!(invalid.parse::<InstanceName>().is_err());
         }
+    }
+
+    #[test]
+    fn project_images_are_version_locked() {
+        assert_eq!(
+            app_image(),
+            format!(
+                "ghcr.io/zcashlabs/thus-spoke-zakura-app:{}",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
+        assert_eq!(
+            lightwalletd_image(),
+            format!(
+                "ghcr.io/zcashlabs/thus-spoke-zakura-lightwalletd:{}",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
     }
 }
