@@ -36,6 +36,8 @@ enum Command {
         #[arg(long)]
         dev: bool,
     },
+    /// Pull the exact runtime images for this launcher version.
+    Pull,
     /// Show service and endpoint status.
     Status,
     /// Open the dashboard in the default browser.
@@ -68,6 +70,7 @@ fn main() -> Result<()> {
     match cli.command.unwrap_or(Command::Start { no_open: false }) {
         Command::Start { no_open } => runtime.start(&cli.name, no_open, cli.json),
         Command::Build { dev } => runtime.build(dev),
+        Command::Pull => runtime.pull(),
         Command::Status => runtime.status(&cli.name, cli.json),
         Command::Open => runtime.open(&cli.name),
         Command::Endpoints => runtime.endpoints(&cli.name, cli.json),
@@ -92,6 +95,9 @@ mod tests {
 
         let cli = Cli::try_parse_from(["thus-spoke-zakura", "build", "--dev"]).unwrap();
         assert!(matches!(cli.command, Some(Command::Build { dev: true })));
+
+        let cli = Cli::try_parse_from(["thus-spoke-zakura", "pull"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Pull)));
 
         assert!(Cli::try_parse_from(["thus-spoke-zakura", "start", "--build"]).is_err());
     }

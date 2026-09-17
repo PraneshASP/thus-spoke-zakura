@@ -3,13 +3,19 @@
 A local-first Zcash Regtest environment powered by Zakura.
 
 ```console
-thus-spoke-zakura build
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/zcashlabs/thus-spoke-zakura/main/install.sh | sh
 thus-spoke-zakura
 ```
 
 The launcher creates an isolated Zakura node, lightwalletd, five development
 accounts, a hidden mining treasury, faucet and mining controls, and a browser-based wallet/explorer. Host
 ports are chosen automatically and bind only to `127.0.0.1`.
+
+The installer supports Linux and macOS on x86-64 and ARM64. It verifies the
+release checksum, validates the downloaded launcher, pulls its exact matching
+runtime images, and only then atomically replaces an existing installation.
+Install a particular release with `TSZ_VERSION=v0.1.0`; use
+`TSZ_SKIP_IMAGE_PULL=1` only when the images have already been provisioned.
 
 ## Requirements
 
@@ -56,7 +62,8 @@ thus-spoke-zakura
 
 The dashboard opens automatically. Use `--no-open` in headless or scripted
 environments. The current local runtime uses `zakuracore/zakura:1.2.0` and the
-project's `0.1.0` app and lightwalletd images. Docker builds retain Cargo
+project app and lightwalletd images whose tags exactly match the launcher's
+Cargo version. Docker builds retain Cargo
 registry, Git, and target caches through BuildKit cache mounts.
 
 ## CLI
@@ -64,7 +71,8 @@ registry, Git, and target caches through BuildKit cache mounts.
 Every command accepts `--name <instance>`; the default name is `default`.
 
 ```text
-build [--dev]       Build all runtime images
+pull                Pull exact production images for this launcher version
+build [--dev]       Build those images from the current source checkout
 start [--no-open]   Run an existing image in the foreground
 status              Show health and endpoints
 open                Open the dashboard
@@ -95,6 +103,12 @@ Then start the already-built images without a subcommand:
 ```console
 cargo run -p thus-spoke-zakura
 ```
+
+A published installation normally runs `thus-spoke-zakura pull` during
+installation. `start` never pulls or builds implicitly, so a run is
+reproducible and will fail with a precise command if an exact image is absent.
+The mutable `latest` image aliases are provided for human discovery only and
+are never consumed by the launcher.
 
 With no subcommand, `thus-spoke-zakura` defaults to `start`. Every start creates
 a fresh development environment, deleting any previous state for the selected
@@ -139,6 +153,18 @@ initialize its root-owned Docker named volume; its gRPC port remains bound only
 to loopback on the host.
 
 This software is for Regtest only. Generated keys must never receive real funds.
+
+## Releases
+
+Maintainers create a release candidate by updating the workspace version and
+pushing the matching `vX.Y.Z` tag. CI tests the workspace, creates native
+launcher archives for Linux and macOS on x86-64 and ARM64, publishes multi-arch
+app and lightwalletd images, emits checksums, provenance, and image SBOMs, then
+opens a draft GitHub release. Publishing that draft promotes the already-built
+image manifests to `latest` and runs an anonymous installation smoke test.
+
+The complete maintainer procedure and one-time repository settings are in
+[`RELEASING.md`](RELEASING.md).
 
 ## Troubleshooting
 

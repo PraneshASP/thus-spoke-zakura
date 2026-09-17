@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.91"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/zakura-core/thus-spoke-zakura"
+repository = "https://github.com/zcashlabs/thus-spoke-zakura"
 
 [workspace.dependencies]
 anyhow = "1.0"
