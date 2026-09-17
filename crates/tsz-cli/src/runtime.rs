@@ -398,6 +398,18 @@ fn ensure_lightwalletd(prefix: &str, name: &InstanceName) -> Result<()> {
 fn ensure_app(prefix: &str, name: &InstanceName) -> Result<()> {
     let target = format!("{prefix}-app");
     if !container_exists(&target)? {
+        let public_rpc = format!(
+            "http://127.0.0.1:{}",
+            published_port(&format!("{prefix}-zakura"), "18232/tcp")?
+        );
+        let public_lightwalletd = format!(
+            "http://127.0.0.1:{}",
+            published_port(&format!("{prefix}-lightwalletd"), "9067/tcp")?
+        );
+        let public_p2p = format!(
+            "127.0.0.1:{}",
+            published_port(&format!("{prefix}-zakura"), "18233/tcp")?
+        );
         docker([
             "create",
             "--name",
@@ -416,6 +428,12 @@ fn ensure_app(prefix: &str, name: &InstanceName) -> Result<()> {
             "TSZ_LIGHTWALLETD=http://lightwalletd:9067",
             "-e",
             &format!("TSZ_INSTANCE={name}"),
+            "-e",
+            &format!("TSZ_PUBLIC_ZAKURA_RPC={public_rpc}"),
+            "-e",
+            &format!("TSZ_PUBLIC_LIGHTWALLETD={public_lightwalletd}"),
+            "-e",
+            &format!("TSZ_PUBLIC_P2P={public_p2p}"),
             "-v",
             &format!("{prefix}-wallet:/data"),
             APP_IMAGE,

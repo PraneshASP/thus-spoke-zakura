@@ -4,7 +4,7 @@ use anyhow::Context;
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode, header::HOST},
     response::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
@@ -104,14 +104,36 @@ struct Status {
     account_count: usize,
     auto_mine: bool,
     network: &'static str,
+    endpoints: PublicEndpoints,
 }
-async fn status(State(state): State<AppState>) -> ApiResult<Json<Status>> {
+
+#[derive(Serialize)]
+struct PublicEndpoints {
+    dashboard: String,
+    zakura_rpc: String,
+    lightwalletd: String,
+    p2p: String,
+}
+
+async fn status(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Status>> {
+    let dashboard_host = headers
+        .get(HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("127.0.0.1:8080");
     Ok(Json(Status {
         instance: state.0.instance.clone(),
         node: state.0.rpc.chain_info().await.ok(),
         account_count: state.0.store.user_accounts()?.len(),
         auto_mine: true,
         network: "Regtest",
+        endpoints: PublicEndpoints {
+            dashboard: format!("http://{dashboard_host}"),
+            zakura_rpc: std::env::var("TSZ_PUBLIC_ZAKURA_RPC")
+                .unwrap_or_else(|_| "http://127.0.0.1:18232".into()),
+            lightwalletd: std::env::var("TSZ_PUBLIC_LIGHTWALLETD")
+                .unwrap_or_else(|_| "http://127.0.0.1:9067".into()),
+            p2p: std::env::var("TSZ_PUBLIC_P2P").unwrap_or_else(|_| "127.0.0.1:18233".into()),
+        },
     }))
 }
 async fn accounts(State(state): State<AppState>) -> ApiResult<Json<Vec<Account>>> {
