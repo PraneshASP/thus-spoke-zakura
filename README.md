@@ -1,8 +1,9 @@
 # Thus Spoke Zakura
 
-A one-command, local-first Zcash Regtest environment powered by Zakura.
+A local-first Zcash Regtest environment powered by Zakura.
 
 ```console
+thus-spoke-zakura build
 thus-spoke-zakura
 ```
 
@@ -44,14 +45,13 @@ cargo test --workspace
 cd web && npm ci && npm run build
 ```
 
-Build the runtime images and install the launcher:
+Install the launcher, then build the runtime images separately:
 
 ```console
-docker build -t ghcr.io/zakura-core/thus-spoke-zakura-app:0.1.0 .
-docker build -f docker/lightwalletd.Dockerfile -t ghcr.io/zakura-core/thus-spoke-zakura-lightwalletd:0.1.0 .
 cargo install --path crates/tsz-cli
 thus-spoke-zakura doctor
-thus-spoke-zakura start
+thus-spoke-zakura build
+thus-spoke-zakura
 ```
 
 The dashboard opens automatically. Use `--no-open` in headless or scripted
@@ -64,7 +64,8 @@ registry, Git, and target caches through BuildKit cache mounts.
 Every command accepts `--name <instance>`; the default name is `default`.
 
 ```text
-start [--no-open] [--build|--build-dev]  Run in foreground; optionally rebuild images
+build [--dev]       Build all runtime images
+start [--no-open]   Run an existing image in the foreground
 status              Show health and endpoints
 open                Open the dashboard
 endpoints [--json]  Print integration endpoints
@@ -75,11 +76,10 @@ list                List instances
 doctor              Verify Docker connectivity
 ```
 
-During development, rebuild the app and lightwalletd images before starting a
-fresh environment:
+Build optimized runtime images with:
 
 ```console
-cargo run -p thus-spoke-zakura -- start --build
+cargo run -p thus-spoke-zakura -- build
 ```
 
 For a faster edit/build/run loop, compile the workspace code without release
@@ -87,14 +87,21 @@ optimizations or LTO while keeping third-party dependencies optimized for
 usable cryptographic proving performance:
 
 ```console
-cargo run -p thus-spoke-zakura -- start --build-dev
+cargo run -p thus-spoke-zakura -- build --dev
 ```
 
-Every `start` creates a fresh development environment, deleting any previous
-state for the selected instance first. It keeps control of the terminal after
-the environment becomes ready. Press Ctrl+C (or send the platform's termination
-signal) to remove its containers, volumes, network, chain, wallet, seed, index,
-configuration, and local metadata.
+Then start the already-built images without a subcommand:
+
+```console
+cargo run -p thus-spoke-zakura
+```
+
+With no subcommand, `thus-spoke-zakura` defaults to `start`. Every start creates
+a fresh development environment, deleting any previous state for the selected
+instance first. It keeps control of the terminal after the environment becomes
+ready. Press Ctrl+C (or send the platform's termination signal) to remove its
+containers, volumes, network, chain, wallet, seed, index, configuration, and
+local metadata.
 
 `reset --force` permanently removes the selected instance's chain, wallet,
 seed, and index volumes. No command binds services beyond loopback.

@@ -87,20 +87,18 @@ impl Runtime {
         Ok(())
     }
 
-    pub fn start(
-        &self,
-        name: &InstanceName,
-        no_open: bool,
-        build: bool,
-        build_dev: bool,
-        json: bool,
-    ) -> Result<()> {
+    pub fn build(&self, dev: bool) -> Result<()> {
         self.doctor(false)?;
-        if build || build_dev {
-            build_project_images(build_dev)?;
-        }
+        build_project_images(dev)?;
+        ensure_image(ZAKURA_IMAGE)?;
+        println!("Runtime images are ready.");
+        Ok(())
+    }
+
+    pub fn start(&self, name: &InstanceName, no_open: bool, json: bool) -> Result<()> {
+        self.doctor(false)?;
         for image in [APP_IMAGE, ZAKURA_IMAGE, LIGHTWALLETD_IMAGE] {
-            ensure_image(image)?;
+            require_image(image)?;
         }
         println!("Preparing a fresh {name} environment…");
         self.delete_instance_resources(name)?;
@@ -466,6 +464,12 @@ fn ensure_image(image: &str) -> Result<()> {
     if docker_output(["image", "inspect", image]).is_err() {
         println!("Pulling {image}…");
         docker(["pull", image])?;
+    }
+    Ok(())
+}
+fn require_image(image: &str) -> Result<()> {
+    if docker_output(["image", "inspect", image]).is_err() {
+        bail!("required image {image} is unavailable; run `thus-spoke-zakura build` first");
     }
     Ok(())
 }
