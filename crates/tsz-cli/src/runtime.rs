@@ -133,10 +133,11 @@ impl Runtime {
 
         ensure_zakura(&prefix, name)?;
         ensure_lightwalletd(&prefix, name)?;
-        ensure_app(&prefix, name)?;
-        for service in ["zakura", "lightwalletd", "app"] {
+        for service in ["zakura", "lightwalletd"] {
             docker(["start", &format!("{prefix}-{service}")])?;
         }
+        ensure_app(&prefix, name)?;
+        docker(["start", &format!("{prefix}-app")])?;
         let endpoints = inspect_endpoints(&prefix)?;
         self.write_instance(name, &endpoints)?;
         wait_ready(
