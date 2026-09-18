@@ -86,7 +86,7 @@ jobs:
           path: thus-spoke-zakura-${{ matrix.target }}.tar.gz
           if-no-files-found: error
 
-  images:
+  image-platforms:
     needs: [version, test]
     strategy:
       fail-fast: false
@@ -95,13 +95,30 @@ jobs:
           - name: app
             image: ghcr.io/zcashlabs/thus-spoke-zakura-app
             file: Dockerfile
+            runner: ubuntu-24.04
+            platform: linux/amd64
+            arch: amd64
+          - name: app
+            image: ghcr.io/zcashlabs/thus-spoke-zakura-app
+            file: Dockerfile
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            arch: arm64
           - name: lightwalletd
             image: ghcr.io/zcashlabs/thus-spoke-zakura-lightwalletd
             file: docker/lightwalletd.Dockerfile
-    runs-on: ubuntu-24.04
+            runner: ubuntu-24.04
+            platform: linux/amd64
+            arch: amd64
+          - name: lightwalletd
+            image: ghcr.io/zcashlabs/thus-spoke-zakura-lightwalletd
+            file: docker/lightwalletd.Dockerfile
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - if: github.event_name == 'push'
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
@@ -114,25 +131,95 @@ jobs:
         with:
           context: .
           file: ${{ matrix.file }}
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ matrix.platform }}
           push: ${{ github.event_name == 'push' }}
-          tags: ${{ matrix.image }}:${{ needs.version.outputs.version }}
+          tags: ${{ matrix.image }}:${{ needs.version.outputs.version }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=${{ matrix.name }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}-${{ matrix.arch }}
           labels: |
             org.opencontainers.image.source=https://github.com/zcashlabs/thus-spoke-zakura
             org.opencontainers.image.version=${{ needs.version.outputs.version }}
             org.opencontainers.image.revision=${{ github.sha }}
           provenance: mode=max
           sbom: true
+      - name: Record image digest
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="$(docker buildx imagetools inspect \
+            "${{ matrix.image }}:${{ needs.version.outputs.version }}-${{ matrix.arch }}" \
+            --format '{{.Manifest.Digest}}')"
+          test -n "$digest"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
       - if: github.event_name == 'push'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: digest-${{ matrix.name }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  image-manifests:
+    if: github.event_name == 'push'
+    needs: [version, image-platforms]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: app
+            image: ghcr.io/zcashlabs/thus-spoke-zakura-app
+          - name: lightwalletd
+            image: ghcr.io/zcashlabs/thus-spoke-zakura-lightwalletd
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: digest-${{ matrix.name }}-*
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: manifest
+        name: Create multi-platform manifest
+        shell: bash
+        run: |
+          image="${{ matrix.image }}"
+          sources=()
+          while IFS= read -r digest; do
+            sources+=("$image@sha256:$(basename "$digest")")
+          done < <(find "${{ runner.temp }}/digests" -type f | sort)
+          test "${#sources[@]}" -eq 2
+          docker buildx imagetools create \
+            --tag "$image:${{ needs.version.outputs.version }}" \
+            "${sources[@]}"
+          digest="$(docker buildx imagetools inspect \
+            "$image:${{ needs.version.outputs.version }}" \
+            --format '{{.Manifest.Digest}}')"
+          test -n "$digest"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - name: Verify manifest platforms
+        shell: bash
+        run: |
+          image="${{ matrix.image }}:${{ needs.version.outputs.version }}"
+          platforms="$(docker buildx imagetools inspect "$image" \
+            --format '{{range .Manifest.Manifests}}{{if .Platform}}{{.Platform.OS}}/{{.Platform.Architecture}}{{"\n"}}{{end}}{{end}}')"
+          grep -qx 'linux/amd64' <<< "$platforms"
+          grep -qx 'linux/arm64' <<< "$platforms"
+      - name: Attest multi-platform manifest
         uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3
         with:
           subject-name: ${{ matrix.image }}
-          subject-digest: ${{ steps.build.outputs.digest }}
+          subject-digest: ${{ steps.manifest.outputs.digest }}
           push-to-registry: true
 
   draft:
     if: github.event_name == 'push'
-    needs: [version, launcher, images]
+    needs: [version, launcher, image-manifests]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

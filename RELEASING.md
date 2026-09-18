@@ -36,6 +36,29 @@ workflows must not weaken repository policy.
    manifests to the convenience `latest` tags without rebuilding them, then
    tests the public installer without GHCR credentials.
 
+### Multi-platform image builds
+
+Release images are built as independent native-platform jobs. AMD64 builds run
+on `ubuntu-24.04`, while ARM64 builds run on `ubuntu-24.04-arm`; release-mode
+Rust compilation must not run through QEMU. Each job pushes an immutable image
+digest, and the workflow creates the versioned multi-platform manifest only
+after both architecture jobs succeed. Architecture tags use the form
+`<version>-amd64` and `<version>-arm64`; the assembly job resolves these to
+immutable digests before creating the public `<version>` tag. The combined manifest is then verified
+for `linux/amd64` and `linux/arm64` and receives a build-provenance attestation.
+
+BuildKit layers are persisted with the GitHub Actions cache, scoped by image
+and architecture. This keeps incompatible architectures isolated while letting
+later release candidates reuse unchanged dependency and build layers. A manual
+workflow dispatch follows the same native build matrix and populates the cache,
+but does not push digests or create manifests.
+
+For comparison, the `v0.2.0` app-image job took 75 minutes 12 seconds when its
+ARM64 Rust release build ran under QEMU. The first uncached native dry run took
+7 minutes 40 seconds for AMD64 and 7 minutes 34 seconds for ARM64, reducing the
+app-image critical path by about 90%. Cached runs should be recorded in issue
+#29 as further releases exercise the persistent caches.
+
 Do not delete and recreate a released tag. A correction gets a new patch
 version so the binary and its exact-version runtime images remain an auditable
 set.
