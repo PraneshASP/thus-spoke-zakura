@@ -135,69 +135,8 @@ impl Runtime {
         for image in [app_image(), lightwalletd_image(), ZAKURA_IMAGE.to_owned()] {
             require_image(&image)?;
         }
-        println!("Preparing a fresh {name} environment…");
-        self.delete_instance_resources(name)?;
-        fs::create_dir_all(self.instance_dir(name))?;
-        let prefix = prefix(name);
-        ensure_network(&prefix)?;
-        for suffix in ["chain", "wallet", "lightwalletd", "config"] {
-            ensure_volume(&format!("{prefix}-{suffix}"), name)?;
-        }
-
-        println!("Starting {name}…");
-        if !container_exists(&format!("{prefix}-init"))? {
-            docker([
-                "create",
-                "--name",
-                &format!("{prefix}-init"),
-                "--label",
-                &label(name),
-                "-v",
-                &format!("{prefix}-wallet:/data"),
-                "-v",
-                &format!("{prefix}-config:/config"),
-                &app_image(),
-                "init",
-                "--data-dir",
-                "/data",
-                "--config-dir",
-                "/config",
-            ])?;
-            docker(["start", "-a", &format!("{prefix}-init")])?;
-        }
-
-        ensure_zakura(&prefix, name)?;
-        ensure_lightwalletd(&prefix, name)?;
-        let zakura_container = format!("{prefix}-zakura");
-        docker(["start", &zakura_container])?;
-        let zakura_rpc = format!(
-            "http://127.0.0.1:{}",
-            published_port(&zakura_container, "18232/tcp")?
-        );
-        wait_for_zakura_tip(&zakura_rpc, &zakura_container, Duration::from_secs(120))?;
-        docker(["start", &format!("{prefix}-lightwalletd")])?;
-        ensure_app(&prefix, name)?;
-        docker(["start", &format!("{prefix}-app")])?;
-        let endpoints = inspect_endpoints(&prefix)?;
-        self.write_instance(name, &endpoints)?;
-        wait_ready(
-            &endpoints.dashboard,
-            &format!("{prefix}-app"),
-            Duration::from_secs(120),
-        )?;
-        if json {
-            println!("{}", serde_json::to_string_pretty(&endpoints)?);
-        } else {
-            print_endpoints(name, &endpoints);
-        }
-        if !no_open {
-            open_url(&endpoints.dashboard)?;
-        }
-        wait_for_shutdown()?;
-        println!("\nStopping and deleting {name}…");
-        self.delete_instance_resources(name)?;
-        println!("Deleted {name} and all of its development data.");
-        Ok(())
+        let shutdown = Shutdown::install()?;
+        self.start_with(name, no_open, json, &DockerHost, &shutdown)
     }
 
     pub fn status(&self, name: &InstanceName, json: bool) -> Result<()> {
@@ -717,6 +656,105 @@ trait StartHost {
     fn wait_for_shutdown(&self, shutdown: &Shutdown) -> Result<()>;
 }
 
+struct DockerHost;
+
+impl StartHost for DockerHost {
+    fn delete(&self, runtime: &Runtime, name: &InstanceName) -> Result<()> {
+        runtime.delete_instance_resources(name)
+    }
+
+    fn allocate(
+        &self,
+        runtime: &Runtime,
+        name: &InstanceName,
+        shutdown: &Shutdown,
+    ) -> Result<Endpoints> {
+        fs::create_dir_all(runtime.instance_dir(name))?;
+        let prefix = prefix(name);
+        ensure_network(&prefix)?;
+        if shutdown.try_interrupted() {
+            bail!("interrupted");
+        }
+        for suffix in ["chain", "wallet", "lightwalletd", "config"] {
+            ensure_volume(&format!("{prefix}-{suffix}"), name)?;
+        }
+        if shutdown.try_interrupted() {
+            bail!("interrupted");
+        }
+
+        if !container_exists(&format!("{prefix}-init"))? {
+            docker([
+                "create",
+                "--name",
+                &format!("{prefix}-init"),
+                "--label",
+                &label(name),
+                "-v",
+                &format!("{prefix}-wallet:/data"),
+                "-v",
+                &format!("{prefix}-config:/config"),
+                &app_image(),
+                "init",
+                "--data-dir",
+                "/data",
+                "--config-dir",
+                "/config",
+            ])?;
+            if shutdown.try_interrupted() {
+                bail!("interrupted");
+            }
+            docker(["start", "-a", &format!("{prefix}-init")])?;
+            if shutdown.try_interrupted() {
+                bail!("interrupted");
+            }
+        }
+
+        ensure_zakura(&prefix, name)?;
+        if shutdown.try_interrupted() {
+            bail!("interrupted");
+        }
+        ensure_lightwalletd(&prefix, name)?;
+        if shutdown.try_interrupted() {
+            bail!("interrupted");
+        }
+        for service in ["zakura", "lightwalletd"] {
+            docker(["start", &format!("{prefix}-{service}")])?;
+            if shutdown.try_interrupted() {
+                bail!("interrupted");
+            }
+        }
+        ensure_app(&prefix, name)?;
+        if shutdown.try_interrupted() {
+            bail!("interrupted");
+        }
+        docker(["start", &format!("{prefix}-app")])?;
+        if shutdown.try_interrupted() {
+            bail!("interrupted");
+        }
+        let endpoints = inspect_endpoints(&prefix)?;
+        runtime.write_instance(name, &endpoints)?;
+        Ok(endpoints)
+    }
+
+    fn wait_ready(
+        &self,
+        endpoints: &Endpoints,
+        app_container: &str,
+        timeout: Duration,
+        shutdown: &Shutdown,
+    ) -> Result<()> {
+        wait_ready(&endpoints.dashboard, app_container, timeout, shutdown)
+    }
+
+    fn open_url(&self, url: &str) -> Result<()> {
+        open_url(url)
+    }
+
+    fn wait_for_shutdown(&self, shutdown: &Shutdown) -> Result<()> {
+        shutdown.wait()
+    }
+}
+
 struct CleanupOnDrop<'a> {
     runtime: &'a Runtime,
     name: &'a InstanceName,
@@ -780,15 +818,6 @@ impl Runtime {
     }
 }
 
-fn wait_for_shutdown() -> Result<()> {
-    let (sender, receiver) = mpsc::channel();
-    ctrlc::set_handler(move || {
-        let _ = sender.send(());
-    })
-    .context("installing the shutdown signal handler")?;
-    println!("\nPress Ctrl+C to stop and delete this development environment.");
-    receiver.recv().context("waiting for a shutdown signal")
-}
 fn container_running(name: &str) -> Result<bool> {
     Ok(docker_output([
         "container",
@@ -798,9 +827,17 @@ fn container_running(name: &str) -> Result<bool> {
         name,
     ])? == "true")
 }
-fn wait_ready(base: &str, app_container: &str, timeout: Duration) -> Result<()> {
+fn wait_ready(
+    base: &str,
+    app_container: &str,
+    timeout: Duration,
+    shutdown: &Shutdown,
+) -> Result<()> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
+        if shutdown.try_interrupted() {
+            bail!("interrupted");
+        }
         if Command::new("curl")
             .args(["-fsS", &format!("{base}/api/v1/health")])
             .stdout(Stdio::null())
@@ -1157,5 +1194,20 @@ mod tests {
         let shutdown = Shutdown::from_receiver(receiver);
         sender.send(()).unwrap();
         shutdown.wait().unwrap();
+    }
+
+    #[test]
+    fn wait_ready_aborts_when_shutdown_is_signaled() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let shutdown = Shutdown::from_receiver(receiver);
+        sender.send(()).unwrap();
+        let err = wait_ready(
+            "http://127.0.0.1:1",
+            "missing-app",
+            Duration::from_secs(5),
+            &shutdown,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("interrupted"));
     }
 }
