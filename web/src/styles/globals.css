@@ -1,0 +1,411 @@
+@import 'tailwindcss';
+
+/* Self-hosted so the dashboard renders offline and under strict content
+   blockers. */
+@import '@fontsource/manrope/400.css';
+@import '@fontsource/manrope/500.css';
+@import '@fontsource/manrope/600.css';
+@import '@fontsource/manrope/700.css';
+@import '@fontsource/dm-mono/400.css';
+@import '@fontsource/dm-mono/500.css';
+
+/**
+ * Light, crisp, two-hue system: paper white and sakura pink, with everything
+ * else in neutral grey. Depth comes from 1px bevels rather than colour, so the
+ * only saturated thing on screen is the accent — and the accent always means
+ * the same thing.
+ */
+@theme {
+  --font-sans: 'Manrope', system-ui, sans-serif;
+  --font-mono: 'DM Mono', ui-monospace, monospace;
+
+  /* Surfaces. Neutrals sit in the accent's hue family at 5-7% saturation:
+     a blue-grey ground under a warm rose accent reads as two unrelated
+     palettes, which is the single biggest thing that made this look unfinished. */
+  --color-canvas: #f2f0f1;
+  --color-panel: #ffffff;
+  --color-raised: #f8f7f7;
+  --color-sunken: #fdfcfc;
+
+  /* Lines and bevels */
+  --color-line: #e3dfe0;
+  --color-line-strong: #c4bdbf;
+  --color-bevel-light: #ffffff;
+  --color-bevel-dark: #bab3b5;
+
+  /* Control faces. The XP bevel assumes light from the top-left; on a dark
+     theme the highlight simply stops being white. */
+  --color-face-top: #ffffff;
+  --color-face-bottom: #eceef4;
+  --color-caption-top: #ffffff;
+
+  /* Shadows are a token because pure black is invisible on a dark canvas. */
+  --shadow-pop: 2px 2px 4px rgb(0 0 0 / 0.14);
+  --shadow-float: 2px 2px 8px rgb(0 0 0 / 0.18);
+  --shadow-modal: 4px 4px 16px rgb(0 0 0 / 0.28);
+
+  /* Ink */
+  --color-ink: #1b1719;
+  --color-ink-muted: #6b6366;
+  /* Decorative only — icons, rules, disabled marks. It cannot reach 4.5:1
+     on any surface here, so it is never used for text. */
+  --color-ink-subtle: #a49a9d;
+
+  /* Accent: sakura. A real cherry blossom is a warm, desaturated rose
+     (hue ~344, saturation ~42%), not the cool magenta a "pink" slider lands
+     on. `accent` clears 4.57:1 against white text; `accent-strong` clears
+     7.76:1 on white for body copy. */
+  --color-accent: #b9556f;
+  --color-accent-hover: #a34760;
+  --color-accent-ink: #ffffff;
+  --color-accent-soft: #fdf0f3;
+  --color-accent-line: #f2cdd6;
+  --color-accent-strong: #8a3550;
+  /* Decoration sits ON a surface, so it steps away from it: darker in the
+     light theme, lighter in the dark one. Verified to clear a ~1.25 effective
+     luminance step at the opacity each is used at. */
+  --color-petal: #eba1b6;
+  --color-petal-edge: #e690a9;
+  --color-shimmer: #f0ccd8;
+  --color-flash: #f8ccd9;
+
+  /* Status, kept desaturated so the accent stays the loudest thing present. */
+  --color-positive: #276b43;
+  --color-positive-soft: #e9f5ed;
+  --color-warning: #8a5f14;
+  --color-warning-soft: #fbf2e0;
+  --color-negative: #b2324e;
+  --color-negative-soft: #fdebee;
+
+  --radius-panel: 3px;
+  --radius-control: 3px;
+
+  /* Motion. Durations are short and easing is shared so the interface feels
+     like one system rather than a pile of independent effects. */
+  --ease-out-soft: cubic-bezier(0.22, 1, 0.36, 1);
+
+  --animate-rise: rise 320ms var(--ease-out-soft) both;
+  --animate-pop: pop 180ms var(--ease-out-soft) both;
+  --animate-flash: flash 1100ms var(--ease-out-soft);
+  --animate-slide-in: slide-in 220ms var(--ease-out-soft) both;
+  --animate-shimmer: shimmer 1400ms linear infinite;
+  --animate-drift: drift linear infinite;
+  --animate-bloom: bloom-turn 90s linear infinite;
+  --animate-sweep: sweep 1.1s var(--ease-out-soft) infinite;
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes pop {
+  from {
+    opacity: 0;
+    transform: scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* Draws attention to a value that just changed, then gets out of the way. */
+@keyframes flash {
+  0% {
+    background-color: var(--color-flash);
+    color: var(--color-accent-strong);
+  }
+  70% {
+    background-color: var(--color-flash);
+  }
+  100% {
+    background-color: transparent;
+  }
+}
+
+@keyframes slide-in {
+  from {
+    opacity: 0;
+    transform: translateX(12px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes shimmer {
+  from {
+    background-position: -180% 0;
+  }
+  to {
+    background-position: 180% 0;
+  }
+}
+
+/* A petal falling and tumbling across the hero.
+   Travel is an absolute length: a percentage here would resolve against the
+   petal's own ~12px height, which is why an earlier version barely moved. */
+@keyframes drift {
+  0% {
+    opacity: 0;
+    transform: translate3d(0, -20px, 0) rotate(0deg);
+  }
+  10% {
+    opacity: var(--petal-opacity, 0.85);
+  }
+  85% {
+    opacity: var(--petal-opacity, 0.85);
+  }
+  100% {
+    opacity: 0;
+    transform: translate3d(var(--petal-drift, 24px), var(--petal-fall, 220px), 0)
+      rotate(var(--petal-spin, 320deg));
+  }
+}
+
+/* Indeterminate progress: a highlight travelling across the viewport. */
+@keyframes sweep {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(350%);
+  }
+}
+
+/* The hero blossom turns slowly enough to read as alive, not as motion. */
+@keyframes bloom-turn {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@utility skeleton {
+  background-image: linear-gradient(
+    90deg,
+    var(--color-raised) 25%,
+    var(--color-shimmer) 50%,
+    var(--color-raised) 75%
+  );
+  background-size: 220% 100%;
+  animation: var(--animate-shimmer);
+}
+
+/* Raised control: light from the top-left, shadow to the bottom-right.
+ *
+ * Which edge carries the relief depends on the substrate. Against a near-white
+ * face a brighter highlight has nowhere to go, so the dark edge does the work
+ * (measured relief 1.92, shadow-led). Against a near-black face the reverse is
+ * true, so the highlight leads (2.12, highlight-led). Equalising the *ratio*
+ * instead of the strength is what previously left dark-mode controls flat.
+ */
+@utility xp-raised {
+  border: 1px solid var(--color-line-strong);
+  box-shadow:
+    inset 1px 1px 0 var(--color-bevel-light),
+    inset -1px -1px 0 var(--color-bevel-dark);
+}
+
+/* Recessed surface, used for inputs and wells. */
+@utility xp-sunken {
+  border: 1px solid var(--color-line-strong);
+  box-shadow:
+    inset 1px 1px 0 var(--color-bevel-dark),
+    inset -1px -1px 0 var(--color-bevel-light);
+}
+
+/* A raised control that physically depresses when pressed. */
+@utility xp-press {
+  transition: background-color 90ms ease;
+
+  &:active:not(:disabled) {
+    box-shadow:
+      inset 1px 1px 0 var(--color-bevel-dark),
+      inset -1px -1px 0 var(--color-bevel-light);
+    transform: translate(1px, 1px);
+  }
+}
+
+/* Panel chrome: a titled window with a gradient caption bar. */
+@utility xp-window {
+  border: 1px solid var(--color-line-strong);
+  background: var(--color-panel);
+  box-shadow: inset 1px 1px 0 var(--color-bevel-light);
+}
+
+@utility xp-caption {
+  background: linear-gradient(180deg, var(--color-caption-top) 0%, var(--color-raised) 100%);
+  border-bottom: 1px solid var(--color-line);
+  color: var(--color-ink);
+}
+
+/* Control faces get a subtle top-light so the bevel reads as a physical
+   surface rather than a flat rectangle — the XP button, essentially. */
+@utility xp-face {
+  background: linear-gradient(
+    180deg,
+    var(--color-face-top) 0%,
+    var(--color-raised) 62%,
+    var(--color-face-bottom) 100%
+  );
+}
+
+@utility xp-face-accent {
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--color-accent) 90%, var(--color-face-top)) 0%,
+    var(--color-accent) 70%,
+    color-mix(in srgb, var(--color-accent-hover) 88%, var(--color-ink)) 100%
+  );
+}
+
+/* An explicit choice always wins; otherwise follow the system. Both selectors
+   set the same custom properties, so the whole interface re-themes from here
+   and no component needs a dark: variant. */
+@custom-variant dark (&:where([data-theme='dark'], [data-theme='dark'] *));
+
+@layer theme {
+  [data-theme='dark'],
+  :root:not([data-theme]) {
+    @media (prefers-color-scheme: dark) {
+      /* Surfaces stay neutral. Tinting them toward the accent — as the light
+         theme does — reads as a muddy colour cast at these luminances; on
+         dark the accent should be the only chromatic thing on screen. */
+      --color-canvas: #0e0f11;
+      --color-panel: #16181b;
+      --color-raised: #1e2126;
+      --color-sunken: #0a0b0c;
+
+      --color-line: #272a2f;
+      --color-line-strong: #3a3e45;
+      --color-bevel-light: #4d5460;
+      --color-bevel-dark: #0d0f11;
+      --color-face-top: #24272c;
+      --color-face-bottom: #131518;
+      --color-caption-top: #1f2227;
+
+      --color-ink: #eef0f3;
+      --color-ink-muted: #a6abb3;
+      --color-ink-subtle: #6e737b;
+
+      --color-accent: #e08aa0;
+      --color-accent-hover: #f0a8b9;
+      --color-accent-ink: #1a1013;
+      --color-accent-soft: #221b1e;
+      --color-accent-line: #453035;
+      --color-accent-strong: #f0a8b9;
+      --color-petal: #5c4753;
+      --color-petal-edge: #6b5261;
+      --color-shimmer: #383b45;
+      --color-flash: #403037;
+
+      --color-positive: #6cc48d;
+      --color-positive-soft: #14201a;
+      --color-warning: #d8b263;
+      --color-warning-soft: #221e14;
+      --color-negative: #e58a9a;
+      --color-negative-soft: #241a1d;
+
+      --shadow-pop: 2px 2px 6px rgb(0 0 0 / 0.5);
+      --shadow-float: 2px 2px 12px rgb(0 0 0 / 0.55);
+      --shadow-modal: 4px 4px 24px rgb(0 0 0 / 0.65);
+    }
+  }
+
+  /* The same values, applied unconditionally when dark is chosen explicitly. */
+  [data-theme='dark'] {
+    /* Surfaces stay neutral. Tinting them toward the accent — as the light
+       theme does — reads as a muddy colour cast at these luminances; on
+       dark the accent should be the only chromatic thing on screen. */
+    --color-canvas: #0e0f11;
+    --color-panel: #16181b;
+    --color-raised: #1e2126;
+    --color-sunken: #0a0b0c;
+
+    --color-line: #272a2f;
+    --color-line-strong: #3a3e45;
+    --color-bevel-light: #4d5460;
+    --color-bevel-dark: #0d0f11;
+    --color-face-top: #24272c;
+    --color-face-bottom: #131518;
+    --color-caption-top: #1f2227;
+
+    --color-ink: #eef0f3;
+    --color-ink-muted: #a6abb3;
+    --color-ink-subtle: #6e737b;
+
+    --color-accent: #e08aa0;
+    --color-accent-hover: #f0a8b9;
+    --color-accent-ink: #1a1013;
+    --color-accent-soft: #221b1e;
+    --color-accent-line: #453035;
+    --color-accent-strong: #f0a8b9;
+    --color-petal: #5c4753;
+    --color-petal-edge: #6b5261;
+    --color-shimmer: #383b45;
+    --color-flash: #403037;
+
+    --color-positive: #6cc48d;
+    --color-positive-soft: #14201a;
+    --color-warning: #d8b263;
+    --color-warning-soft: #221e14;
+    --color-negative: #e58a9a;
+    --color-negative-soft: #241a1d;
+
+    --shadow-pop: 2px 2px 6px rgb(0 0 0 / 0.5);
+    --shadow-float: 2px 2px 12px rgb(0 0 0 / 0.55);
+    --shadow-modal: 4px 4px 24px rgb(0 0 0 / 0.65);
+  }
+}
+
+@layer base {
+  html {
+    /* Native scrollbars, form controls and browser chrome follow the theme. */
+    color-scheme: light;
+  }
+
+  [data-theme='dark'] {
+    color-scheme: dark;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme]) {
+      color-scheme: dark;
+    }
+  }
+
+  body {
+    margin: 0;
+    min-width: 320px;
+    background: var(--color-canvas);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    font-synthesis: none;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 1px;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}

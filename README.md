@@ -62,7 +62,20 @@ Building from source additionally requires Rust 1.98 and Node 24.
 
 ```console
 cargo test --workspace
-cd web && npm ci && npm run build
+cd web && npm ci && npm run lint && npm test && npm run build
+```
+
+The dashboard is a Vite + React single-page app. Its colour system lives in
+`web/src/styles/globals.css`: every colour is a token, and `theme.test.ts`
+asserts contrast and light/dark parity, so a palette change that fails
+readability fails the build rather than shipping.
+
+```console
+cd web
+npm run dev        # dev server; TSZ_DEV_API=http://127.0.0.1:<port> targets a running instance
+npm test           # unit and component tests
+npm run lint       # ESLint, type-aware
+npm run format     # Prettier
 ```
 
 Install the launcher, then build the runtime images separately:

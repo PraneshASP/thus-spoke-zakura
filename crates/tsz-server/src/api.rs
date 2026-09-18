@@ -4,9 +4,10 @@ use anyhow::Context;
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode, header::HOST},
+    handler::HandlerWithoutStateExt,
+    http::{HeaderMap, StatusCode, Uri, header::HOST},
     response::{
-        IntoResponse, Response,
+        Html, IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
     routing::{get, post},
@@ -14,10 +15,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
-use tower_http::{
-    services::{ServeDir, ServeFile},
-    trace::TraceLayer,
-};
+use tower_http::{services::ServeDir, trace::TraceLayer};
 
 use crate::{
     db::{Account, Activity, Store, TREASURY_ACCOUNT_ID, USER_ACCOUNT_COUNT, ZATOSHIS_PER_ZEC},
@@ -50,11 +48,50 @@ impl AppState {
     }
 }
 
+/// Serves the dashboard shell for client-side routes only.
+///
+/// The dashboard is a single-page app, so an unknown path is usually a route
+/// like `/explorer/block/42` and must return the shell with `200`. It is not
+/// a blanket catch-all: an unknown `/api/` path is a genuine 404, and a
+/// missing asset must stay a 404 rather than returning HTML that the browser
+/// would then try to parse as JavaScript or CSS.
+async fn spa_fallback(uri: Uri, index: Arc<Option<String>>) -> Response {
+    let path = uri.path();
+    let looks_like_a_file = path
+        .rsplit('/')
+        .next()
+        .is_some_and(|last| last.contains('.'));
+
+    if path.starts_with("/api/") || looks_like_a_file {
+        return ApiError {
+            status: StatusCode::NOT_FOUND,
+            message: format!("{path} does not exist"),
+        }
+        .into_response();
+    }
+
+    match index.as_ref() {
+        Some(html) => Html(html.clone()).into_response(),
+        None => (StatusCode::NOT_FOUND, "dashboard assets are not installed").into_response(),
+    }
+}
+
+/// Static assets plus the single-page fallback.
+fn dashboard_router(static_dir: PathBuf) -> Router {
+    // Read once: the shell is small and immutable for the life of the process.
+    let index_html = Arc::new(std::fs::read_to_string(static_dir.join("index.html")).ok());
+    Router::new().fallback_service(
+        // `not_found_service` would wrap the fallback in `SetStatus(404)`,
+        // which renders correctly but reports every deep link as missing.
+        ServeDir::new(static_dir)
+            .fallback((move |uri: Uri| spa_fallback(uri, Arc::clone(&index_html))).into_service()),
+    )
+}
+
 pub fn router(state: AppState) -> Router {
     let static_dir = std::env::var("TSZ_WEB_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("web/dist"));
-    let index = static_dir.join("index.html");
     Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/status", get(status))
@@ -71,7 +108,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/addresses/{address}", get(address))
         .route("/api/v1/search", get(search))
         .route("/api/v1/events", get(events))
-        .fallback_service(ServeDir::new(static_dir).not_found_service(ServeFile::new(index)))
+        .fallback_service(dashboard_router(static_dir))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -355,6 +392,10 @@ async fn mine_and_sync(state: &AppState, blocks: u32) -> anyhow::Result<Vec<Stri
         .wait_for_height(tip_height, Duration::from_secs(120))
         .await?;
     state.0.wallet.sync().await?;
+    // Every caller here produces blocks, so the chain moved for everyone, not
+    // just the tab that asked. Without this, other dashboards keep the old
+    // height and tip until something else happens to mine.
+    notify(state, "chain");
     Ok(hashes)
 }
 
@@ -448,11 +489,79 @@ async fn blocks(
         json!({"blocks":page,"next_before":start.checked_sub(1)}),
     ))
 }
+fn transparent_prevout_ids(tx: &Value) -> Vec<String> {
+    let Some(vin) = tx.get("vin").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut ids = Vec::new();
+    for input in vin {
+        if input.get("coinbase").is_some() {
+            continue;
+        }
+        let Some(txid) = input.get("txid").and_then(Value::as_str) else {
+            continue;
+        };
+        if !ids.iter().any(|id| id == txid) {
+            ids.push(txid.to_owned());
+        }
+    }
+    ids
+}
+
+/// Node `getrawtransaction` does not include the spent output. Copy address
+/// and value from the previous transaction so the explorer can list inputs.
+fn attach_transparent_prevouts(
+    tx: &mut Value,
+    prev_txs: &std::collections::HashMap<String, Value>,
+) {
+    let Some(vin) = tx.get_mut("vin").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for input in vin {
+        if input.get("coinbase").is_some() {
+            continue;
+        }
+        let Some(prev_txid) = input.get("txid").and_then(Value::as_str).map(str::to_owned) else {
+            continue;
+        };
+        let Some(n) = input.get("vout").and_then(Value::as_u64) else {
+            continue;
+        };
+        let Some(prev) = prev_txs.get(&prev_txid) else {
+            continue;
+        };
+        let Some(vout) = prev.get("vout").and_then(Value::as_array) else {
+            continue;
+        };
+        let Some(out) = vout
+            .iter()
+            .find(|out| out.get("n").and_then(Value::as_u64) == Some(n))
+            .or_else(|| vout.get(n as usize))
+        else {
+            continue;
+        };
+        if let Some(value_zat) = out.get("valueZat").cloned() {
+            input["valueZat"] = value_zat;
+        }
+        if let Some(script) = out.get("scriptPubKey").cloned() {
+            input["scriptPubKey"] = script;
+        }
+    }
+}
+
 async fn transaction(
     State(state): State<AppState>,
     Path(txid): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    Ok(Json(state.0.rpc.transaction(&txid).await?))
+    let mut tx = state.0.rpc.transaction(&txid).await?;
+    let mut prev_txs = std::collections::HashMap::new();
+    for prev_id in transparent_prevout_ids(&tx) {
+        if let Ok(prev) = state.0.rpc.transaction(&prev_id).await {
+            prev_txs.insert(prev_id, prev);
+        }
+    }
+    attach_transparent_prevouts(&mut tx, &prev_txs);
+    Ok(Json(tx))
 }
 async fn mempool(State(state): State<AppState>) -> ApiResult<Json<Value>> {
     Ok(Json(json!({"transactions":state.0.rpc.mempool().await?})))
@@ -570,6 +679,126 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    /// A dashboard directory containing a recognisable shell and one asset.
+    fn dashboard() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(
+            dir.path().join("index.html"),
+            "<!doctype html><div id=\"root\">",
+        )
+        .expect("write shell");
+        std::fs::create_dir(dir.path().join("assets")).expect("assets dir");
+        std::fs::write(dir.path().join("assets/app.js"), "console.log(1)").expect("write asset");
+        dir
+    }
+
+    async fn get(dir: &tempfile::TempDir, path: &str) -> (StatusCode, String) {
+        let response = dashboard_router(dir.path().to_path_buf())
+            .oneshot(Request::get(path).body(Body::empty()).expect("request"))
+            .await
+            .expect("response");
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// The dashboard is a single-page app: a path it owns is a route, not a
+    /// missing file. This previously returned 404 for every path but `/`,
+    /// because `not_found_service` wraps the fallback in `SetStatus(404)`.
+    #[tokio::test]
+    async fn client_side_routes_return_the_shell() {
+        let dir = dashboard();
+        for path in [
+            "/",
+            "/wallet",
+            "/explorer",
+            "/explorer/block/1209",
+            "/network",
+        ] {
+            let (status, body) = get(&dir, path).await;
+            assert_eq!(status, StatusCode::OK, "{path} should serve the shell");
+            assert!(
+                body.contains("id=\"root\""),
+                "{path} should return the shell markup"
+            );
+        }
+    }
+
+    /// The fallback is scoped, not a catch-all. A missing asset answered with
+    /// HTML would be parsed by the browser as JavaScript or CSS.
+    #[tokio::test]
+    async fn missing_assets_and_unknown_api_paths_stay_404() {
+        let dir = dashboard();
+        for path in [
+            "/api/v1/nope",
+            "/assets/does-not-exist.js",
+            "/favicon.ico",
+            "/nested/path/styles.css",
+        ] {
+            let (status, body) = get(&dir, path).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{path} should be a 404");
+            assert!(
+                !body.contains("id=\"root\""),
+                "{path} must not return the shell"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn real_assets_are_still_served() {
+        let dir = dashboard();
+        let (status, body) = get(&dir, "/assets/app.js").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "console.log(1)");
+    }
+
+    /// A misconfigured TSZ_WEB_DIR should fail visibly rather than serving an
+    /// empty 200 that looks like a working dashboard.
+    #[tokio::test]
+    async fn a_missing_shell_is_reported_rather_than_served_empty() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (status, _) = get(&dir, "/wallet").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn copies_spent_output_address_and_value_onto_vin() {
+        let mut tx = json!({
+            "vin": [{"txid": "aa", "vout": 1}],
+            "vout": []
+        });
+        let mut prev = std::collections::HashMap::new();
+        prev.insert(
+            "aa".into(),
+            json!({
+                "vout": [
+                    {"n": 0, "valueZat": 1},
+                    {
+                        "n": 1,
+                        "valueZat": 50_000_000,
+                        "scriptPubKey": {"addresses": ["tmABC"]}
+                    }
+                ]
+            }),
+        );
+        attach_transparent_prevouts(&mut tx, &prev);
+        assert_eq!(tx["vin"][0]["valueZat"], 50_000_000);
+        assert_eq!(tx["vin"][0]["scriptPubKey"]["addresses"][0], "tmABC");
+    }
+
+    #[test]
+    fn leaves_coinbase_inputs_untouched() {
+        let mut tx = json!({"vin": [{"coinbase": "00"}]});
+        attach_transparent_prevouts(&mut tx, &Default::default());
+        assert_eq!(tx["vin"][0]["coinbase"], "00");
+        assert!(tx["vin"][0].get("valueZat").is_none());
+    }
 
     #[test]
     fn reserves_the_treasury_account_from_public_operations() {

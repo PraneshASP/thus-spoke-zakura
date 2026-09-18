@@ -40,3 +40,8 @@ pczt = { package = "zakura-pczt", version = "=0.1.0-rc3", features = ["signer"] 
 zcash_protocol.workspace = true
 zip32.workspace = true
 zip321 = "0.9"
+
+[dev-dependencies]
+# `oneshot` drives the router in tests without binding a socket.
+tower = { version = "0.5", features = ["util"] }
+tempfile = "3"

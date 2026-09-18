@@ -6,6 +6,17 @@
     <meta name="theme-color" content="#090b0a" />
     <title>Thus Spoke Zakura</title>
   </head>
-  <body><div id="root"></div><script type="module" src="/src/main.tsx"></script></body>
+  <body>
+    <script>
+      // Applied before first paint so a dark-theme reload never flashes white.
+      // Mirrors readStoredTheme()/applyTheme() in src/lib/theme.ts.
+      try {
+        var t = localStorage.getItem('tsz-theme');
+        if (t === 'light' || t === 'dark') document.documentElement.setAttribute('data-theme', t);
+      } catch (e) {}
+    </script>
+    <div id="root"></div>
+    <noscript>The Thus Spoke Zakura dashboard requires JavaScript.</noscript>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
 </html>
-
