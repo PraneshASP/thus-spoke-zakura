@@ -14,7 +14,7 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
 const APP_IMAGE_REPOSITORY: &str = "ghcr.io/zcashlabs/thus-spoke-zakura-app";
-const ZAKURA_IMAGE: &str = "zakuracore/zakura:1.2.0";
+const ZAKURA_IMAGE: &str = "zakuracore/zakura:1.4.0";
 const LIGHTWALLETD_IMAGE_REPOSITORY: &str = "ghcr.io/zcashlabs/thus-spoke-zakura-lightwalletd";
 
 fn app_image() -> String {
@@ -154,9 +154,14 @@ impl Runtime {
 
         ensure_zakura(&prefix, name)?;
         ensure_lightwalletd(&prefix, name)?;
-        for service in ["zakura", "lightwalletd"] {
-            docker(["start", &format!("{prefix}-{service}")])?;
-        }
+        let zakura_container = format!("{prefix}-zakura");
+        docker(["start", &zakura_container])?;
+        let zakura_rpc = format!(
+            "http://127.0.0.1:{}",
+            published_port(&zakura_container, "18232/tcp")?
+        );
+        wait_for_zakura_tip(&zakura_rpc, &zakura_container, Duration::from_secs(120))?;
+        docker(["start", &format!("{prefix}-lightwalletd")])?;
         ensure_app(&prefix, name)?;
         docker(["start", &format!("{prefix}-app")])?;
         let endpoints = inspect_endpoints(&prefix)?;
@@ -601,6 +606,45 @@ fn wait_ready(base: &str, app_container: &str, timeout: Duration) -> Result<()> 
     }
     bail!(
         "dashboard did not become healthy within {} seconds",
+        timeout.as_secs()
+    )
+}
+fn wait_for_zakura_tip(base: &str, container: &str, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let tip_available = Command::new("curl")
+            .args([
+                "-sS",
+                "-H",
+                "content-type: application/json",
+                "--data",
+                r#"{"jsonrpc":"2.0","id":1,"method":"getbestblockhash","params":[]}"#,
+                base,
+            ])
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| serde_json::from_slice::<serde_json::Value>(&output.stdout).ok())
+            .and_then(|response| {
+                response
+                    .get("result")
+                    .and_then(|result| result.as_str())
+                    .map(str::to_owned)
+            })
+            .is_some();
+        if tip_available {
+            return Ok(());
+        }
+        if !container_running(container).unwrap_or(false) {
+            let logs = docker_logs(container)
+                .unwrap_or_else(|error| format!("could not read Zakura logs: {error}"));
+            bail!("Zakura exited before its RPC tip became available:\n{logs}");
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    bail!(
+        "Zakura RPC tip did not become available within {} seconds",
         timeout.as_secs()
     )
 }

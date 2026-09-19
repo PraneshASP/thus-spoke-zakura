@@ -88,7 +88,7 @@ thus-spoke-zakura
 ```
 
 The dashboard opens automatically. Use `--no-open` in headless or scripted
-environments. The current local runtime uses `zakuracore/zakura:1.2.0` and the
+environments. The current local runtime uses `zakuracore/zakura:1.4.0` and the
 project app and lightwalletd images whose tags exactly match the launcher's
 Cargo version. Docker builds retain Cargo
 registry, Git, and target caches through BuildKit cache mounts.
