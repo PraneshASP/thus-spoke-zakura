@@ -28,4 +28,13 @@ describe('ZecAmount', () => {
     renderWithProviders(<ZecAmount zatoshi={0n} className="text-accent-strong" muteZero={false} />);
     expect(screen.getByText(/0/).className).toContain('text-accent-strong');
   });
+
+  it('switches directly to the new balance without displaying intermediate amounts', () => {
+    const view = renderWithProviders(<ZecAmount zatoshi={500_000_000n} />);
+
+    view.rerender(<ZecAmount zatoshi={700_000_000n} />);
+
+    expect(screen.getByText('7 ZEC')).toBeInTheDocument();
+    expect(screen.queryByText('6 ZEC')).not.toBeInTheDocument();
+  });
 });
