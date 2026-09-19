@@ -15,6 +15,7 @@ use zcash_client_backend::{
     data_api::{
         Account as _, AccountBirthday, WalletRead, WalletWrite,
         chain::{BlockCache, BlockSource, ChainState, error},
+        error::Error as WalletError,
         scanning::ScanRange,
         wallet::{
             ConfirmationsPolicy, SpendingKeys, create_proposed_transactions,
@@ -48,6 +49,14 @@ use zip321::{Payment, TransactionRequest};
 use crate::db::Account;
 
 type Db = WalletDb<rusqlite::Connection, LocalNetwork, SystemClock, UnwrapErr<SysRng>>;
+
+#[derive(Debug, thiserror::Error)]
+pub enum PaymentError {
+    #[error("insufficient spendable funds (have {available}, need {required} including fees)")]
+    InsufficientFunds { available: u64, required: u64 },
+    #[error("faucet treasury remains insufficient after replenishment")]
+    TreasuryExhausted,
+}
 
 #[derive(Clone)]
 pub struct RealWallet {
@@ -308,7 +317,6 @@ impl RealWallet {
                 None,
                 None,
             )
-            .map_err(|e| anyhow::anyhow!("proposing transparent transaction: {e}"))?
         } else if source_pool == "orchard" {
             propose_standard_transfer_to_address::<_, _, Infallible>(
                 &mut *db,
@@ -324,10 +332,19 @@ impl RealWallet {
                 None,
                 None,
             )
-            .map_err(|e| anyhow::anyhow!("proposing Orchard transaction: {e}"))?
         } else {
             bail!("source pool must be transparent or orchard")
-        };
+        }
+        .map_err(|error| match error {
+            WalletError::InsufficientFunds {
+                available,
+                required,
+            } => anyhow::Error::new(PaymentError::InsufficientFunds {
+                available: u64::from(available),
+                required: u64::from(required),
+            }),
+            error => anyhow::anyhow!("proposing {source_pool} transaction: {error}"),
+        })?;
         let seed = hex::decode(seed_hex)?;
         let usk = UnifiedSpendingKey::from_seed(
             &params,
@@ -400,7 +417,12 @@ impl RealWallet {
             None,
             None,
         )
-        .map_err(|e| anyhow::anyhow!("proposing coinbase shielding: {e}"))?;
+        .map_err(|e| match e {
+            WalletError::InsufficientFunds { .. } => {
+                anyhow::Error::new(PaymentError::TreasuryExhausted)
+            }
+            e => anyhow::anyhow!("proposing coinbase shielding: {e}"),
+        })?;
         let seed = hex::decode(seed_hex)?;
         let account_index = treasury_account
             .checked_sub(1)
