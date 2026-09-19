@@ -28,6 +28,7 @@ export function FaucetDialog({
 
   const form = useForm<FaucetInput, unknown, FaucetValues>({
     resolver: zodResolver(faucetSchema),
+    mode: 'onChange',
     // Defaults to 1 ZEC rather than the 5 ZEC ceiling: the treasury is funded
     // from block rewards, and requests at the maximum are the first to fail
     // once the subsidy has halved.
@@ -90,7 +91,13 @@ export function FaucetDialog({
           )}
         </Field>
 
-        <Button type="submit" variant="primary" size="block" loading={faucet.isPending}>
+        <Button
+          type="submit"
+          variant="primary"
+          size="block"
+          loading={faucet.isPending}
+          disabled={!form.formState.isValid || faucet.isPending}
+        >
           {faucet.isPending ? 'Requesting…' : 'Add funds'}
         </Button>
       </form>

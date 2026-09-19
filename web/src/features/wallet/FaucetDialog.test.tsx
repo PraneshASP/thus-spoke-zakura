@@ -38,18 +38,20 @@ describe('FaucetDialog', () => {
     expect(screen.getByLabelText('Amount (ZEC)')).toHaveValue('1');
   });
 
-  it('rejects amounts above the server-side faucet limit before submitting', async () => {
+  it('shows the faucet limit while editing and prevents submission', async () => {
     const fetchSpy = vi.spyOn(globalThis, 'fetch');
     renderWithProviders(<FaucetDialog open onOpenChange={vi.fn()} accounts={testAccounts} />);
 
     const amount = screen.getByLabelText('Amount (ZEC)');
     await userEvent.clear(amount);
     await userEvent.type(amount, '6');
-    await userEvent.click(screen.getByRole('button', { name: 'Add funds' }));
 
     expect(await screen.findByRole('alert')).toHaveTextContent(
       'The faucet is limited to 5 ZEC per request.',
     );
+    expect(screen.getByRole('button', { name: 'Add funds' })).toBeDisabled();
+
+    await userEvent.keyboard('{Enter}');
     expect(fetchSpy).not.toHaveBeenCalled();
     fetchSpy.mockRestore();
   });
