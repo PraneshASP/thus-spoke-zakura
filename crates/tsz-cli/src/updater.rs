@@ -14,6 +14,7 @@ const RELEASE_API: &str =
     "https://api.github.com/repos/zcashlabs/thus-spoke-zakura/releases/latest";
 const INSTALLER: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../install.sh"));
 const UPDATE_AVAILABLE_EXIT: u8 = 10;
+const STARTUP_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Deserialize)]
 struct Release {
@@ -67,6 +68,23 @@ pub fn run(requested: Option<&str>, check: bool, json: bool) -> Result<ExitCode>
     Ok(ExitCode::SUCCESS)
 }
 
+pub fn startup_notice() -> Option<String> {
+    if !cfg!(feature = "release-distribution") {
+        return None;
+    }
+
+    let current = parse_version(env!("CARGO_PKG_VERSION")).ok()?;
+    let endpoint = env::var("TSZ_RELEASE_API_URL").unwrap_or_else(|_| RELEASE_API.to_owned());
+    startup_notice_from(&endpoint, &current)
+}
+
+fn startup_notice_from(endpoint: &str, current: &Version) -> Option<String> {
+    let available = latest_version_from_with_timeout(endpoint, STARTUP_CHECK_TIMEOUT).ok()?;
+    (compare_versions(current, &available) == Status::UpdateAvailable).then(|| {
+        format!("Update available: {current} → {available}. Run `ths update` to install it.")
+    })
+}
+
 pub fn uninstall() -> Result<ExitCode> {
     ensure_release_distribution()?;
     let executable = env::current_exe().context("locating the running launcher")?;
@@ -102,8 +120,12 @@ fn latest_version() -> Result<Version> {
 }
 
 fn latest_version_from(endpoint: &str) -> Result<Version> {
+    latest_version_from_with_timeout(endpoint, Duration::from_secs(15))
+}
+
+fn latest_version_from_with_timeout(endpoint: &str, timeout: Duration) -> Result<Version> {
     let response = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(15))
+        .timeout(timeout)
         .build()
         .context("creating the release client")?
         .get(endpoint)
@@ -239,6 +261,23 @@ mod tests {
         let endpoint = serve_once("403 Forbidden", r#"{"message":"rate limited"}"#);
         let error = latest_version_from(&endpoint).unwrap_err().to_string();
         assert!(error.contains("HTTP 403"));
+    }
+
+    #[test]
+    fn startup_notice_is_actionable_and_fail_open() {
+        let current = Version::new(2, 3, 3);
+        let endpoint = serve_once("200 OK", r#"{"tag_name":"v2.3.4"}"#);
+        assert_eq!(
+            startup_notice_from(&endpoint, &current).as_deref(),
+            Some("Update available: 2.3.3 → 2.3.4. Run `ths update` to install it.")
+        );
+
+        let current = Version::new(2, 3, 4);
+        let endpoint = serve_once("200 OK", r#"{"tag_name":"v2.3.4"}"#);
+        assert!(startup_notice_from(&endpoint, &current).is_none());
+
+        let endpoint = serve_once("503 Service Unavailable", "unavailable");
+        assert!(startup_notice_from(&endpoint, &current).is_none());
     }
 
     #[test]
