@@ -84,6 +84,11 @@ fn main() -> Result<ExitCode> {
     if matches!(cli.command, Some(Command::Uninstall)) {
         return updater::uninstall();
     }
+    if should_check_for_updates(&cli)
+        && let Some(notice) = updater::startup_notice()
+    {
+        println!("{notice}");
+    }
     let runtime = Runtime::discover()?;
     match cli.command.unwrap_or(Command::Start { no_open: false }) {
         Command::Start { no_open } => runtime.start(&cli.name, no_open, cli.json),
@@ -101,6 +106,10 @@ fn main() -> Result<ExitCode> {
         Command::Doctor => runtime.doctor(cli.json),
     }?;
     Ok(ExitCode::SUCCESS)
+}
+
+fn should_check_for_updates(cli: &Cli) -> bool {
+    !cli.json && matches!(cli.command, None | Some(Command::Start { .. }))
 }
 
 fn _assert_pathbuf_send(_: PathBuf) {}
@@ -135,5 +144,20 @@ mod tests {
         assert!(Cli::try_parse_from(["ths", "update", "1.2.3", "--check"]).is_err());
 
         assert!(Cli::try_parse_from(["ths", "start", "--build"]).is_err());
+    }
+
+    #[test]
+    fn checks_for_updates_only_during_human_readable_startup() {
+        let default = Cli::try_parse_from(["ths"]).unwrap();
+        assert!(should_check_for_updates(&default));
+
+        let start = Cli::try_parse_from(["ths", "start", "--no-open"]).unwrap();
+        assert!(should_check_for_updates(&start));
+
+        let json = Cli::try_parse_from(["ths", "--json"]).unwrap();
+        assert!(!should_check_for_updates(&json));
+
+        let status = Cli::try_parse_from(["ths", "status"]).unwrap();
+        assert!(!should_check_for_updates(&status));
     }
 }
