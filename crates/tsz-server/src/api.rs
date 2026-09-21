@@ -470,11 +470,11 @@ async fn faucet_address(
     let treasury = state.0.store.account(TREASURY_ACCOUNT_ID)?;
     let txid =
         send_with_replenishment(&state, &seed, &treasury, &req.address, req.amount_zatoshi).await?;
-    let hashes = mine_and_sync(&state, 1).await?;
-    let block_hash = hashes
-        .into_iter()
-        .next()
-        .context("Zakura did not return the confirmation block hash")?;
+    mine_and_sync(&state, 1).await?;
+    let mined = state.0.rpc.transaction(&txid).await?;
+    let block_hash = confirmed_block_hash(&mined)
+        .context("faucet transaction was not included in a block")?
+        .to_owned();
     Ok(Json(FaucetAddressResponse {
         address: req.address,
         amount_zatoshi: req.amount_zatoshi,
@@ -509,13 +509,7 @@ async fn fund_from_treasury(
         .0
         .store
         .faucet(account_id, pool, amount_zatoshi, idempotency_key, &txid)?;
-    let hashes = mine_and_sync(state, 1).await?;
-    let confirmed = state.0.store.confirm(
-        &pending.id,
-        hashes.first().map(String::as_str).unwrap_or(""),
-    )?;
-    notify(state, "wallet");
-    Ok(confirmed)
+    confirm_after_mining(state, pending).await
 }
 
 #[derive(Deserialize)]
@@ -909,18 +903,59 @@ async fn events(
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
 }
 
-async fn confirm_after_mining(state: &AppState, pending: Activity) -> ApiResult<Activity> {
-    match state.0.rpc.generate(1).await {
-        Ok(hashes) => {
-            let confirmed = state.0.store.confirm(
-                &pending.id,
-                hashes.first().map(String::as_str).unwrap_or(""),
-            )?;
-            notify(state, "wallet");
-            Ok(confirmed)
+fn confirmed_block_hash(tx: &Value) -> Option<&str> {
+    let confirmations = tx.get("confirmations").and_then(Value::as_u64).unwrap_or(0);
+    if confirmations == 0 {
+        return None;
+    }
+    tx.get("blockhash")
+        .and_then(Value::as_str)
+        .filter(|hash| !hash.is_empty())
+}
+
+fn apply_confirmation(store: &Store, pending: &Activity, tx: &Value) -> anyhow::Result<Activity> {
+    match confirmed_block_hash(tx) {
+        Some(hash) => store.confirm(&pending.id, hash),
+        None => Ok(pending.clone()),
+    }
+}
+
+async fn confirm_from_chain(state: &AppState, pending: Activity) -> anyhow::Result<Activity> {
+    if pending.status == "confirmed" {
+        return Ok(pending);
+    }
+    match state.0.rpc.transaction(&pending.txid).await {
+        Ok(tx) => {
+            let updated = apply_confirmation(&state.0.store, &pending, &tx)?;
+            if updated.status == "confirmed" {
+                notify(state, "wallet");
+            }
+            Ok(updated)
         }
         Err(error) => {
-            tracing::warn!(%error, activity = %pending.id, "transaction recorded but auto-mine failed");
+            tracing::warn!(
+                %error,
+                txid = %pending.txid,
+                "could not fetch transaction for confirmation"
+            );
+            Ok(pending)
+        }
+    }
+}
+
+async fn confirm_after_mining(state: &AppState, pending: Activity) -> anyhow::Result<Activity> {
+    let pending = confirm_from_chain(state, pending).await?;
+    if pending.status == "confirmed" {
+        return Ok(pending);
+    }
+    match mine_and_sync(state, 1).await {
+        Ok(_) => confirm_from_chain(state, pending).await,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                activity = %pending.id,
+                "transaction recorded but auto-mine failed"
+            );
             Ok(pending)
         }
     }
@@ -1165,6 +1200,74 @@ mod tests {
         attach_transparent_prevouts(&mut tx, &Default::default());
         assert_eq!(tx["vin"][0]["coinbase"], "00");
         assert!(tx["vin"][0].get("valueZat").is_none());
+    }
+
+    #[test]
+    fn confirmed_block_hash_requires_confirmations_and_blockhash() {
+        assert_eq!(
+            confirmed_block_hash(&json!({
+                "txid": "abc",
+                "confirmations": 1,
+                "blockhash": "0".repeat(64)
+            })),
+            Some("0000000000000000000000000000000000000000000000000000000000000000")
+        );
+        assert_eq!(
+            confirmed_block_hash(&json!({
+                "txid": "abc",
+                "confirmations": 0,
+                "blockhash": "0".repeat(64)
+            })),
+            None
+        );
+        assert_eq!(
+            confirmed_block_hash(&json!({"txid": "abc", "confirmations": 3})),
+            None
+        );
+        assert_eq!(
+            confirmed_block_hash(&json!({"txid": "abc", "blockhash": "0".repeat(64)})),
+            None
+        );
+        assert_eq!(
+            confirmed_block_hash(&json!({
+                "txid": "abc",
+                "confirmations": 1,
+                "blockhash": ""
+            })),
+            None
+        );
+        assert_eq!(confirmed_block_hash(&json!({"txid": "abc"})), None);
+    }
+
+    #[test]
+    fn apply_confirmation_uses_node_blockhash_not_a_generate_hash() {
+        let store = Store::open(":memory:").unwrap();
+        store.initialize().unwrap();
+        let pending = store
+            .transfer(1, 2, "orchard", "orchard", 12_000, "issue-67", "txid-abc")
+            .unwrap();
+        assert_eq!(pending.status, "broadcast");
+
+        let generate_hash = "generate-hash-that-must-not-be-stored";
+        let mempool = json!({"txid": "txid-abc", "confirmations": 0});
+        let still = apply_confirmation(&store, &pending, &mempool).unwrap();
+        assert_eq!(still.status, "broadcast");
+        assert_eq!(still.block_hash, None);
+
+        let mined = json!({
+            "txid": "txid-abc",
+            "confirmations": 1,
+            "blockhash": "b".repeat(64)
+        });
+        let confirmed = apply_confirmation(&store, &pending, &mined).unwrap();
+        let expected_hash = "b".repeat(64);
+        assert_eq!(confirmed.status, "confirmed");
+        assert_eq!(
+            confirmed.block_hash.as_deref(),
+            Some(expected_hash.as_str())
+        );
+        assert_ne!(confirmed.block_hash.as_deref(), Some(generate_hash));
+        assert_eq!(confirmed.txid, "txid-abc");
     }
 
     #[test]
