@@ -750,10 +750,21 @@ impl StartHost for DockerHost {
         shutdown.check()?;
         ensure_lightwalletd(&prefix, name)?;
         shutdown.check()?;
-        for service in ["zakura", "lightwalletd"] {
-            docker(["start", &format!("{prefix}-{service}")])?;
-            shutdown.check()?;
-        }
+        let zakura_container = format!("{prefix}-zakura");
+        docker(["start", &zakura_container])?;
+        shutdown.check()?;
+        let zakura_rpc = format!(
+            "http://127.0.0.1:{}",
+            published_port(&zakura_container, "18232/tcp")?
+        );
+        wait_for_zakura_tip(
+            &zakura_rpc,
+            &zakura_container,
+            Duration::from_secs(120),
+            shutdown,
+        )?;
+        docker(["start", &format!("{prefix}-lightwalletd")])?;
+        shutdown.check()?;
         ensure_app(&prefix, name)?;
         shutdown.check()?;
         docker(["start", &format!("{prefix}-app")])?;
@@ -889,9 +900,15 @@ fn wait_ready(
         timeout.as_secs()
     )
 }
-fn wait_for_zakura_tip(base: &str, container: &str, timeout: Duration) -> Result<()> {
+fn wait_for_zakura_tip(
+    base: &str,
+    container: &str,
+    timeout: Duration,
+    shutdown: &Shutdown,
+) -> Result<()> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
+        shutdown.check()?;
         let tip_available = Command::new("curl")
             .args([
                 "-sS",
@@ -921,7 +938,11 @@ fn wait_for_zakura_tip(base: &str, container: &str, timeout: Duration) -> Result
                 .unwrap_or_else(|error| format!("could not read Zakura logs: {error}"));
             bail!("Zakura exited before its RPC tip became available:\n{logs}");
         }
-        thread::sleep(Duration::from_millis(250));
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        shutdown.wait_timeout(remaining.min(Duration::from_millis(250)))?;
     }
     bail!(
         "Zakura RPC tip did not become available within {} seconds",
@@ -1269,6 +1290,21 @@ mod tests {
         let err = wait_ready(
             "http://127.0.0.1:1",
             "missing-app",
+            Duration::from_secs(5),
+            &shutdown,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("interrupted"));
+    }
+
+    #[test]
+    fn wait_for_zakura_tip_aborts_when_shutdown_is_signaled() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let shutdown = Shutdown::from_receiver(receiver);
+        sender.send(()).unwrap();
+        let err = wait_for_zakura_tip(
+            "http://127.0.0.1:1",
+            "missing-zakura",
             Duration::from_secs(5),
             &shutdown,
         )
