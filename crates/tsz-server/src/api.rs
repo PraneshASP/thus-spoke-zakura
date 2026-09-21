@@ -160,6 +160,7 @@ impl AppState {
         if changed {
             notify(self, "wallet");
         }
+        reconcile_unconfirmed(self).await?;
         Ok(())
     }
 
@@ -369,7 +370,7 @@ async fn send(
     require_user_account(req.from_account)?;
     require_user_account(req.to_account)?;
     if let Some(existing) = state.0.store.activity_for_key(&req.idempotency_key)? {
-        return Ok(Json(existing));
+        return Ok(Json(confirm_after_mining(&state, existing).await?));
     }
     state.synchronize_latest().await?;
     let destination = state.0.store.account(req.to_account)?;
@@ -491,7 +492,7 @@ async fn fund_from_treasury(
     idempotency_key: &str,
 ) -> anyhow::Result<Activity> {
     if let Some(existing) = state.0.store.activity_for_key(idempotency_key)? {
-        return Ok(existing);
+        return confirm_after_mining(state, existing).await;
     }
     let destination = state.0.store.account(account_id)?;
     let address = match pool {
@@ -695,18 +696,22 @@ async fn mine_and_sync(state: &AppState, blocks: u32) -> anyhow::Result<Vec<Stri
 
 pub async fn provision_initial_balance(state: &AppState) -> anyhow::Result<()> {
     const INITIAL_FUNDING_KEY: &str = "startup-account-1-orchard-v1";
+    if let Some(existing) = state.0.store.activity_for_key(INITIAL_FUNDING_KEY)?
+        && existing.status == "confirmed"
+    {
+        return Ok(());
+    }
+    let seed = state.0.store.seed()?;
+    let treasury = state.0.store.account(TREASURY_ACCOUNT_ID)?;
     if state
         .0
         .store
         .activity_for_key(INITIAL_FUNDING_KEY)?
-        .is_some()
+        .is_none()
     {
-        return Ok(());
+        // A fresh wallet needs scanned blocks before a proposal can determine its target height.
+        replenish_treasury(state, &seed, &treasury).await?;
     }
-    // A fresh wallet needs scanned blocks before a proposal can determine its target height.
-    let seed = state.0.store.seed()?;
-    let treasury = state.0.store.account(TREASURY_ACCOUNT_ID)?;
-    replenish_treasury(state, &seed, &treasury).await?;
     fund_from_treasury(
         state,
         1,
@@ -941,6 +946,13 @@ async fn confirm_from_chain(state: &AppState, pending: Activity) -> anyhow::Resu
             Ok(pending)
         }
     }
+}
+
+async fn reconcile_unconfirmed(state: &AppState) -> anyhow::Result<()> {
+    for activity in state.0.store.unconfirmed_activities()? {
+        confirm_from_chain(state, activity).await?;
+    }
+    Ok(())
 }
 
 async fn confirm_after_mining(state: &AppState, pending: Activity) -> anyhow::Result<Activity> {
