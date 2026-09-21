@@ -18,7 +18,7 @@ chain, and pressing Ctrl+C deletes the containers and development data.
 
 ## Get started
 
-### 1. Install Docker
+### 1. Install Docker Desktop
 
 Install [Docker Desktop](https://www.docker.com/products/docker-desktop/) on
 macOS or Linux, then check that Docker is running:
@@ -73,11 +73,15 @@ mined automatically and appears under **Recent activity**.
 You can use Orchard or transparent balances to exercise different transaction
 routes.
 
+![Send ZEC between development accounts](docs/images/send.png)
+
 ### Mine blocks
 
 Select **Mine** from any dashboard page and enter the number of blocks. This is
 useful when testing confirmations, expiry, coinbase maturity, or code that
 reacts to new blocks.
+
+![Mine blocks on the local Regtest network](docs/images/mine.png)
 
 ### Explore blocks and transactions
 
