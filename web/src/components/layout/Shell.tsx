@@ -16,7 +16,7 @@ export function Shell({ children }: { children: ReactNode }) {
   const { data: status } = useStatus();
 
   return (
-    <div className="min-h-screen md:grid md:grid-cols-[220px_1fr]">
+    <div className="min-h-screen md:grid md:grid-cols-[220px_minmax(0,1fr)]">
       <aside className="border-line bg-panel fixed bottom-0 z-10 flex h-16 w-full flex-row border-t px-2 md:top-0 md:h-screen md:w-[220px] md:flex-col md:border-t-0 md:border-r md:px-3 md:py-5">
         <div className="mb-12 hidden items-center gap-3 md:flex">
           <div className="xp-raised text-accent bg-accent-soft grid size-8 place-items-center rounded-xs">

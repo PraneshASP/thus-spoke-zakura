@@ -67,7 +67,7 @@ export function Row({
       // which every clickable row is required to carry.
       onClick={to ? () => void navigate(to) : undefined}
       className={cn(
-        'border-line hover:bg-accent-soft animate-rise border-b transition-colors last:border-b-0',
+        'border-line hover:bg-accent-soft animate-fade-in border-b transition-colors last:border-b-0',
         '[&>td]:px-5 [&>td]:py-3.5 [&>td]:align-middle',
         to && 'cursor-pointer',
         className,
