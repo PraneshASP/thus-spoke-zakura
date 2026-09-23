@@ -177,6 +177,49 @@ npm test --prefix web
 npm run build --prefix web
 ```
 
+### Activity-recovery integration test
+
+The `activity-recovery` CI job runs the real recovery regression on Linux for
+every push and pull request. It is separate from the normal Rust and web jobs:
+`cargo test --workspace` is Docker-free and cannot establish that this live
+scenario works.
+
+Run the following from the repository root. It requires Rust 1.98.0, Python
+3.11 or newer from the standard library, a running Docker daemon, network
+access to pull `zakuracore/zakura:1.4.0`, and enough local CPU and memory to
+build the pinned lightwalletd image and create a real Orchard proof.
+
+```console
+python3 -B -m unittest discover -s tests -p 'test_regtest_support.py' -v
+cargo build --locked --profile dev-runtime -p tsz-server
+docker pull zakuracore/zakura:1.4.0
+docker build -f docker/lightwalletd.Dockerfile -t tsz-recovery-lightwalletd:local .
+target_directory="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')"
+TSZ_TEST_SERVER="$target_directory/dev-runtime/tsz-server" python3 -B tests/activity_recovery.py -v
+```
+
+With Cargo's default target directory, the last command uses the source-built
+`$PWD/target/dev-runtime/tsz-server`; metadata also keeps it correct when
+`CARGO_TARGET_DIR` is set. Do not point `TSZ_TEST_SERVER` at an installed or
+older binary.
+
+The live test owns a UUID-prefixed `tsz-recovery-*` Docker network, containers,
+and volumes, plus private temporary data/configuration directories and a local
+server process. It sends a genuine 1,000,000-zatoshi (0.01 ZEC) Orchard payment
+from Account 1 to Account 2, deliberately rejects exactly one automatic
+`generate([1])` through a local RPC proxy, mines directly through the node, then
+waits for the production background wallet-sync loop to update the existing
+activity row. Direct mining is intentional: retrying Send or using the server's
+mine endpoint would repair the row through a different path and would not prove
+background recovery.
+
+This is an integration test, not a mocked proof: the image pull/build and
+wallet startup make it materially slower and more resource-intensive than the
+unit suite. Its fixture removes only the resources it created, stops its child
+server, and returns nonzero for a timeout or a cleanup failure. It suppresses
+server process output and does not upload raw process logs, request bodies,
+wallet keys, wallet databases, or configuration directories.
+
 ## How it fits together
 
 ```text

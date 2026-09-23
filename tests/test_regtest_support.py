@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import subprocess
@@ -11,7 +12,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from regtest_support import GenerateFaultProxy, RegtestStack, request_json, rpc, wait_until
+import activity_recovery
+from regtest_support import (
+    GenerateFaultProxy,
+    RecoveryFailureReporter,
+    RegtestStack,
+    request_json,
+    rpc,
+    wait_until,
+)
 
 
 class RecordingRpcServer:
@@ -342,6 +351,15 @@ class RegtestStackReadinessTests(unittest.TestCase):
 
 
 class RegtestStackStartupDiagnosticsTests(unittest.TestCase):
+    def test_published_port_uses_a_complete_docker_go_template(self):
+        stack = RegtestStack(Path("/test-only/tsz-server"))
+        template = '{{(index (index .NetworkSettings.Ports "18232/tcp") 0).HostPort}}'
+
+        with patch.object(stack, "_docker_output", return_value="19001") as docker_output:
+            self.assertEqual(stack._published_port("fixture", "18232/tcp"), 19001)
+
+        docker_output.assert_called_once_with(["inspect", "--format", template, "fixture"])
+
     def test_serve_bind_collision_reports_selected_port_without_log_contents(self):
         stack = RegtestStack(Path("/test-only/tsz-server"))
         stack._api_port = 19444
@@ -481,6 +499,73 @@ class RegtestStackCleanupTests(unittest.TestCase):
             stack.close()
             self.assertEqual(commands, cleanup_commands)
 
+    def test_docker_run_failure_after_creation_cleans_the_owned_container(self):
+        for failed_suffix in ("-zakura", "-lightwalletd"):
+            with self.subTest(failed_suffix=failed_suffix), tempfile.TemporaryDirectory() as directory:
+                server = Path(directory) / "tsz-server"
+                server.write_text("#!/bin/sh\n")
+                os.chmod(server, 0o700)
+                stack = RegtestStack(server)
+                commands = []
+                failed_command = None
+                unrelated = "unrelated-container"
+
+                def fake_run(command, **kwargs):
+                    nonlocal failed_command
+                    command = list(command)
+                    commands.append(command)
+                    if (
+                        command[:3] == ["docker", "run", "--detach"]
+                        and command[command.index("--name") + 1].endswith(failed_suffix)
+                    ):
+                        failed_command = command
+                        raise subprocess.CalledProcessError(125, command)
+                    if command[:3] == ["docker", "inspect", "--format"]:
+                        if command[3] == "{{.State.Running}}":
+                            output = "true\n"
+                        elif command[-1].endswith("-zakura"):
+                            output = "19001\n"
+                        else:
+                            output = "19067\n"
+                        return subprocess.CompletedProcess(command, 0, stdout=output)
+                    return subprocess.CompletedProcess(command, 0, stdout="")
+
+                with (
+                    patch("regtest_support.subprocess.run", side_effect=fake_run),
+                    patch("regtest_support.rpc", return_value={"blocks": 1}),
+                ):
+                    with self.assertRaises(subprocess.CalledProcessError) as failure:
+                        stack.__enter__()
+
+                self.assertEqual(failure.exception.returncode, 125)
+                self.assertEqual(failure.exception.cmd, failed_command)
+                node = f"{stack.prefix}-zakura"
+                lightwalletd = f"{stack.prefix}-lightwalletd"
+                expected_removals = []
+                if failed_suffix == "-lightwalletd":
+                    expected_removals.append(
+                        ["docker", "container", "rm", "-f", lightwalletd]
+                    )
+                expected_removals.extend(
+                    [
+                        ["docker", "container", "rm", "-f", node],
+                        ["docker", "volume", "rm", "-f", lightwalletd],
+                        ["docker", "volume", "rm", "-f", f"{stack.prefix}-chain"],
+                        ["docker", "network", "rm", stack.prefix],
+                    ]
+                )
+                removals = [
+                    command
+                    for command in commands
+                    if command[:3]
+                    in (["docker", "container", "rm"], ["docker", "volume", "rm"], ["docker", "network", "rm"])
+                ]
+                self.assertEqual(removals, expected_removals)
+                self.assertTrue(all(unrelated not in command for command in removals))
+                cleanup_commands = list(commands)
+                stack.close()
+                self.assertEqual(commands, cleanup_commands)
+
     def test_body_failure_keeps_original_error_and_reports_all_cleanup_failures(self):
         stack = RegtestStack(Path("/test-only/tsz-server"))
         cleanup_calls = []
@@ -513,6 +598,134 @@ class RegtestStackCleanupTests(unittest.TestCase):
                 "regtest cleanup failed: second failing removal: second remove failed",
             ],
         )
+
+
+class RecoveryFailureReporterTests(unittest.TestCase):
+    def test_failure_summary_keeps_safe_setup_and_cleanup_context_only(self):
+        stack = RegtestStack(Path("/test-only/tsz-server"))
+        stack._network_name = stack.prefix
+        stack._chain_volume = f"{stack.prefix}-chain"
+        stack._lightwalletd_volume = f"{stack.prefix}-lightwalletd"
+        stack._node_container = f"{stack.prefix}-zakura"
+        stack._lightwalletd_container = f"{stack.prefix}-lightwalletd"
+        stack.cleanup_errors = ["mnemonic request body server log"]
+
+        class ExitedProcess:
+            def poll(self):
+                return 17
+
+        class CountingProxy:
+            def counts(self):
+                return 1, 2
+
+        stack._process = cast(subprocess.Popen[bytes], ExitedProcess())
+        stack.proxy = cast(GenerateFaultProxy, CountingProxy())
+        output = io.StringIO()
+        reporter = RecoveryFailureReporter(stack, stream=output)
+        reporter.record_height("before_auto_mine", 123)
+        reporter.record_activity(
+            {
+                "id": 7,
+                "status": "broadcast",
+                "txid": "ab" * 32,
+                "request_body": "mnemonic private-key database",
+            }
+        )
+
+        reporter.phase("setup")
+        reporter.emit_failure(subprocess.CalledProcessError(19, ["docker", "private"]))
+        reporter.phase("cleanup")
+        reporter.emit_failure(RuntimeError("server log with mnemonic"))
+
+        summaries = [
+            json.loads(line.removeprefix("ACTIVITY_RECOVERY_FAILURE_SUMMARY "))
+            for line in output.getvalue().splitlines()
+        ]
+        self.assertEqual(len(summaries), 2)
+        self.assertEqual(summaries[0]["phase"], "setup")
+        self.assertEqual(summaries[0]["failure_route"], "setup")
+        self.assertEqual(summaries[0]["exit_codes"], {"server": 17, "trigger": 19})
+        self.assertEqual(summaries[0]["heights"]["before_auto_mine"], 123)
+        self.assertEqual(summaries[0]["txid"], "ab" * 32)
+        self.assertEqual(
+            summaries[0]["activity"], {"id": 7, "status": "broadcast"}
+        )
+        self.assertEqual(
+            summaries[0]["proxy_counts"],
+            {"forwarded_generates": 2, "rejected_generates": 1},
+        )
+        self.assertEqual(summaries[0]["owned_resources"]["network"], stack.prefix)
+        self.assertEqual(
+            summaries[0]["owned_resources"]["node_container"],
+            f"{stack.prefix}-zakura",
+        )
+        self.assertEqual(summaries[1]["failure_route"], "cleanup")
+        self.assertEqual(summaries[1]["cleanup"], "failed")
+        self.assertNotIn("mnemonic", output.getvalue())
+        self.assertNotIn("private-key", output.getvalue())
+        self.assertNotIn("request_body", output.getvalue())
+
+    def test_live_test_emits_sanitized_setup_summary_and_preserves_failure(self):
+        stack = RegtestStack(Path("/test-only/tsz-server"))
+        output = io.StringIO()
+        setup_failure = subprocess.CalledProcessError(23, ["docker", "private-command"])
+        recovery = activity_recovery.RecoveryTest(
+            "test_broadcast_recovers_after_auto_mine_failure"
+        )
+        result = unittest.TestResult()
+
+        with (
+            patch.dict(os.environ, {"TSZ_TEST_SERVER": "/test-only/tsz-server"}),
+            patch("activity_recovery.RegtestStack", return_value=stack),
+            patch("regtest_support.sys.stderr", output),
+            patch.object(stack, "_setup", side_effect=setup_failure),
+        ):
+            recovery.run(result)
+
+        self.assertEqual(len(result.errors), 1)
+        summaries = [
+            json.loads(line.removeprefix("ACTIVITY_RECOVERY_FAILURE_SUMMARY "))
+            for line in output.getvalue().splitlines()
+        ]
+        self.assertEqual(len(summaries), 1)
+        self.assertEqual(summaries[0]["phase"], "setup")
+        self.assertEqual(summaries[0]["failure_route"], "setup")
+        self.assertEqual(summaries[0]["exit_codes"]["trigger"], 23)
+        self.assertNotIn("private-command", output.getvalue())
+
+    def test_live_test_missing_server_configuration_emits_one_safe_summary_and_preserves_error(self):
+        output = io.StringIO()
+        recovery = activity_recovery.RecoveryTest(
+            "test_broadcast_recovers_after_auto_mine_failure"
+        )
+        result = unittest.TestResult()
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("regtest_support.sys.stderr", output),
+        ):
+            recovery.run(result)
+
+        self.assertEqual(len(result.errors), 1)
+        self.assertIn("KeyError: 'TSZ_TEST_SERVER'", result.errors[0][1])
+        lines = output.getvalue().splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].startswith("ACTIVITY_RECOVERY_FAILURE_SUMMARY "))
+        summary = json.loads(lines[0].removeprefix("ACTIVITY_RECOVERY_FAILURE_SUMMARY "))
+        self.assertEqual(summary["phase"], "setup")
+        self.assertEqual(summary["failure_route"], "setup")
+        self.assertEqual(summary["exit_codes"], {"server": "not-reached", "trigger": "unavailable"})
+        self.assertEqual(
+            summary["owned_resources"],
+            {
+                "chain_volume": "not-reached",
+                "lightwalletd_container": "not-reached",
+                "lightwalletd_volume": "not-reached",
+                "network": "not-reached",
+                "node_container": "not-reached",
+            },
+        )
+        self.assertNotIn("TSZ_TEST_SERVER", output.getvalue())
 
 
 if __name__ == "__main__":

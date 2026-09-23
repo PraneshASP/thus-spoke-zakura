@@ -2,8 +2,10 @@
 
 import json
 import os
+import re
 import signal
 import socket
+import sys
 import subprocess
 import tempfile
 import threading
@@ -220,6 +222,9 @@ class RegtestStack:
         self._cleanup_lock = threading.Lock()
         self._closed = False
         self._process: subprocess.Popen[bytes] | None = None
+        self._network_name: str | None = None
+        self._chain_volume: str | None = None
+        self._lightwalletd_volume: str | None = None
         self._node_container: str | None = None
         self._lightwalletd_container: str | None = None
         self._api_port: int | None = None
@@ -275,21 +280,25 @@ class RegtestStack:
         lightwalletd_volume = f"{self.prefix}-lightwalletd"
         node_container = f"{self.prefix}-zakura"
         lightwalletd_container = f"{self.prefix}-lightwalletd"
-        self._node_container = node_container
-        self._lightwalletd_container = lightwalletd_container
-
         self._docker(["network", "create", self.prefix])
+        self._network_name = self.prefix
         self._register_cleanup("network", lambda: self._remove_docker("network", self.prefix))
         self._docker(["volume", "create", chain_volume])
+        self._chain_volume = chain_volume
         self._register_cleanup(
             "chain volume", lambda: self._remove_docker("volume", chain_volume)
         )
         self._docker(["volume", "create", lightwalletd_volume])
+        self._lightwalletd_volume = lightwalletd_volume
         self._register_cleanup(
             "lightwalletd volume",
             lambda: self._remove_docker("volume", lightwalletd_volume),
         )
 
+        self._node_container = node_container
+        self._register_cleanup(
+            "node container", lambda: self._remove_docker("container", node_container)
+        )
         self._docker(
             [
                 "run",
@@ -313,15 +322,17 @@ class RegtestStack:
                 "start",
             ]
         )
-        self._register_cleanup(
-            "node container", lambda: self._remove_docker("container", node_container)
-        )
         node_port = self._published_port(node_container, "18232/tcp")
         self.node_url = f"http://127.0.0.1:{node_port}"
         wait_until(
             self._node_ready(node_container), timeout=120, label="Zakura RPC readiness"
         )
 
+        self._lightwalletd_container = lightwalletd_container
+        self._register_cleanup(
+            "lightwalletd container",
+            lambda: self._remove_docker("container", lightwalletd_container),
+        )
         self._docker(
             [
                 "run",
@@ -353,10 +364,6 @@ class RegtestStack:
                 "--log-file",
                 "/dev/stdout",
             ]
-        )
-        self._register_cleanup(
-            "lightwalletd container",
-            lambda: self._remove_docker("container", lightwalletd_container),
         )
         lightwalletd_port = self._published_port(lightwalletd_container, "9067/tcp")
 
@@ -417,7 +424,7 @@ class RegtestStack:
     def _published_port(self, container: str, container_port: str) -> int:
         template = (
             "{{(index (index .NetworkSettings.Ports "
-            f'"{container_port}") 0).HostPort}}'
+            f'"{container_port}") 0).HostPort}}}}'
         )
         try:
             return int(self._docker_output(["inspect", "--format", template, container]))
@@ -555,3 +562,195 @@ class RegtestStack:
         for cleanup_error in self.cleanup_errors:
             original.add_note(f"regtest cleanup failed: {cleanup_error}")
         self._cleanup_errors_reported = True
+
+
+class RecoveryFailureReporter:
+    """Emit bounded, test-only recovery diagnostics without failure payloads."""
+
+    _PHASES = frozenset(
+        {"setup", "broadcast", "auto-mine", "direct-mine", "recovery", "cleanup"}
+    )
+    _HEIGHTS = frozenset(
+        {"before_auto_mine", "after_auto_mine", "inclusion", "tip", "scanned"}
+    )
+    _STATUSES = frozenset({"broadcast", "confirmed"})
+    _TXID = re.compile(r"[0-9a-fA-F]{64}\Z")
+    _NOT_REACHED = "not-reached"
+    _UNAVAILABLE = "unavailable"
+
+    def __init__(self, stack: RegtestStack | None = None, *, stream: Any = None):
+        self._stack = stack
+        self._stream = sys.stderr if stream is None else stream
+        self._phase = "setup"
+        self._heights: dict[str, int | str] = {
+            name: self._NOT_REACHED for name in self._HEIGHTS
+        }
+        self._txid: str = self._NOT_REACHED
+        self._activity_id: int | str = self._NOT_REACHED
+        self._activity_status: str = self._NOT_REACHED
+
+    def attach_stack(self, stack: RegtestStack):
+        self._stack = stack
+
+    def phase(self, phase: str):
+        self._phase = phase if phase in self._PHASES else self._UNAVAILABLE
+
+    def record_height(self, name: str, height: Any):
+        if name not in self._HEIGHTS:
+            return
+        self._heights[name] = (
+            height
+            if isinstance(height, int) and not isinstance(height, bool) and height >= 0
+            else self._UNAVAILABLE
+        )
+
+    def record_activity(self, activity: Any):
+        if not isinstance(activity, dict):
+            self._activity_id = self._UNAVAILABLE
+            self._activity_status = self._UNAVAILABLE
+            self._txid = self._UNAVAILABLE
+            return
+        activity_id = activity.get("id")
+        self._activity_id = (
+            activity_id
+            if isinstance(activity_id, int)
+            and not isinstance(activity_id, bool)
+            and activity_id >= 0
+            else self._UNAVAILABLE
+        )
+        status = activity.get("status")
+        self._activity_status = status if status in self._STATUSES else self._UNAVAILABLE
+        txid = activity.get("txid")
+        self._txid = txid if isinstance(txid, str) and self._TXID.fullmatch(txid) else self._UNAVAILABLE
+
+    def emit_failure(self, error: BaseException):
+        """Print one sanitized record while leaving the original failure untouched."""
+        summary = {
+            "activity": {"id": self._activity_id, "status": self._activity_status},
+            "cleanup": self._cleanup_state(),
+            "exit_codes": {
+                "server": self._server_exit_code(),
+                "trigger": self._trigger_exit_code(error),
+            },
+            "failure_route": self._failure_route(error),
+            "heights": self._heights,
+            "owned_resources": self._owned_resources(),
+            "phase": self._phase,
+            "proxy_counts": self._proxy_counts(),
+            "txid": self._txid,
+        }
+        print(
+            "ACTIVITY_RECOVERY_FAILURE_SUMMARY "
+            + json.dumps(summary, sort_keys=True, separators=(",", ":")),
+            file=self._stream,
+            flush=True,
+        )
+
+    def _cleanup_state(self) -> str:
+        stack = self._stack
+        if stack is None:
+            return self._NOT_REACHED
+        if stack.cleanup_errors:
+            return "failed"
+        return "complete" if stack._closed else self._NOT_REACHED
+
+    def _failure_route(self, error: BaseException) -> str:
+        if isinstance(error, (KeyboardInterrupt, SystemExit)):
+            return "signal"
+        if isinstance(error, TimeoutError):
+            return "timeout"
+        if self._phase == "cleanup":
+            return "cleanup"
+        if isinstance(error, AssertionError):
+            return "assertion"
+        if self._phase == "setup":
+            return "setup"
+        return "error"
+
+    def _trigger_exit_code(self, error: BaseException) -> int | str:
+        if isinstance(error, subprocess.CalledProcessError):
+            returncode = error.returncode
+            if isinstance(returncode, int) and not isinstance(returncode, bool):
+                return returncode
+        return self._UNAVAILABLE
+
+    def _server_exit_code(self) -> int | str:
+        stack = self._stack
+        if stack is None:
+            return self._NOT_REACHED
+        process = stack._process
+        if process is None:
+            return self._NOT_REACHED
+        try:
+            returncode = process.poll()
+        except (OSError, ValueError):
+            return self._UNAVAILABLE
+        if returncode is None:
+            return "running"
+        if isinstance(returncode, int) and not isinstance(returncode, bool):
+            return returncode
+        return self._UNAVAILABLE
+
+    def _safe_prefix(self) -> str | None:
+        stack = self._stack
+        if stack is None:
+            return None
+        prefix = stack.prefix
+        if not isinstance(prefix, str) or not prefix.startswith("tsz-recovery-"):
+            return None
+        try:
+            parsed = uuid.UUID(prefix.removeprefix("tsz-recovery-"))
+        except ValueError:
+            return None
+        return prefix if prefix == f"tsz-recovery-{parsed}" else None
+
+    def _safe_resource(self, name: Any, suffix: str) -> str:
+        prefix = self._safe_prefix()
+        expected = None if prefix is None else f"{prefix}{suffix}"
+        return expected if expected is not None and name == expected else self._NOT_REACHED
+
+    def _owned_resources(self) -> dict[str, str]:
+        stack = self._stack
+        if stack is None:
+            return {
+                "chain_volume": self._NOT_REACHED,
+                "lightwalletd_container": self._NOT_REACHED,
+                "lightwalletd_volume": self._NOT_REACHED,
+                "network": self._NOT_REACHED,
+                "node_container": self._NOT_REACHED,
+            }
+        return {
+            "chain_volume": self._safe_resource(stack._chain_volume, "-chain"),
+            "lightwalletd_container": self._safe_resource(
+                stack._lightwalletd_container, "-lightwalletd"
+            ),
+            "lightwalletd_volume": self._safe_resource(
+                stack._lightwalletd_volume, "-lightwalletd"
+            ),
+            "network": self._safe_resource(stack._network_name, ""),
+            "node_container": self._safe_resource(stack._node_container, "-zakura"),
+        }
+
+    def _proxy_counts(self) -> dict[str, int | str]:
+        stack = self._stack
+        if stack is None or stack.proxy is None:
+            return {
+                "forwarded_generates": self._NOT_REACHED,
+                "rejected_generates": self._NOT_REACHED,
+            }
+        try:
+            rejected, forwarded = stack.proxy.counts()
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+            return {
+                "forwarded_generates": self._UNAVAILABLE,
+                "rejected_generates": self._UNAVAILABLE,
+            }
+        if any(
+            not isinstance(count, int) or isinstance(count, bool) or count < 0
+            for count in (rejected, forwarded)
+        ):
+            return {
+                "forwarded_generates": self._UNAVAILABLE,
+                "rejected_generates": self._UNAVAILABLE,
+            }
+        return {"forwarded_generates": forwarded, "rejected_generates": rejected}
