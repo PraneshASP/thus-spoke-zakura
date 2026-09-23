@@ -5,6 +5,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from typing import cast
 from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError
@@ -283,6 +284,88 @@ class HttpHelperTests(unittest.TestCase):
                 rpc(upstream.url, "mismatched_id", [])
 
 
+class RegtestStackReadinessTests(unittest.TestCase):
+    def setUp(self):
+        self.stack = RegtestStack(Path("/test-only/tsz-server"))
+        self.stack._node_container = f"{self.stack.prefix}-zakura"
+        self.stack._lightwalletd_container = f"{self.stack.prefix}-lightwalletd"
+
+        class FakeProcess:
+            def poll(self):
+                return None
+
+        self.stack._process = cast(subprocess.Popen[bytes], FakeProcess())
+
+    def _ready_response(self, base, path, body=None, timeout=5):
+        return {
+            "/api/v1/health": {"instance": self.stack.prefix},
+            "/api/v1/status": {"wallet_sync": {"state": "ready"}},
+            "/api/v1/accounts": [{"id": 1, "orchard_zatoshi": 500000000}],
+        }[path]
+
+    def test_funded_server_readiness_fails_immediately_when_owned_node_exits(self):
+        checked = []
+
+        def container_running(container):
+            checked.append(container)
+            if container == self.stack._node_container:
+                raise RuntimeError(f"container {container} exited during fixture setup")
+
+        with (
+            patch.object(self.stack, "_container_running", side_effect=container_running),
+            patch("regtest_support.request_json", side_effect=self._ready_response),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "-zakura exited during fixture setup"):
+                self.stack._funded_server_ready()
+
+        self.assertEqual(checked, [self.stack._node_container])
+
+    def test_funded_server_readiness_fails_immediately_when_owned_lightwalletd_exits(self):
+        checked = []
+
+        def container_running(container):
+            checked.append(container)
+            if container == self.stack._lightwalletd_container:
+                raise RuntimeError(f"container {container} exited during fixture setup")
+
+        with (
+            patch.object(self.stack, "_container_running", side_effect=container_running),
+            patch("regtest_support.request_json", side_effect=self._ready_response),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "-lightwalletd exited during fixture setup"):
+                self.stack._funded_server_ready()
+
+        self.assertEqual(
+            checked,
+            [self.stack._node_container, self.stack._lightwalletd_container],
+        )
+
+
+class RegtestStackStartupDiagnosticsTests(unittest.TestCase):
+    def test_serve_bind_collision_reports_selected_port_without_log_contents(self):
+        stack = RegtestStack(Path("/test-only/tsz-server"))
+        stack._api_port = 19444
+
+        class ExitedProcess:
+            def poll(self):
+                return 98
+
+        stack._process = cast(subprocess.Popen[bytes], ExitedProcess())
+        with tempfile.TemporaryDirectory() as directory:
+            stack._serve_stderr_path = Path(directory) / "serve.stderr"
+            stack._serve_stderr_path.write_text(
+                "failed to bind listener: Address already in use; seed-like diagnostic"
+            )
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "could not bind fixture API port 19444 because it is already in use",
+            ) as failure:
+                stack._server_running()
+
+        self.assertNotIn("seed-like diagnostic", str(failure.exception))
+
+
 class RegtestStackCleanupTests(unittest.TestCase):
     def test_builds_a_healthy_funded_fixture_from_owned_resources(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -341,6 +424,11 @@ class RegtestStackCleanupTests(unittest.TestCase):
                     self.assertEqual(stack.node_url, "http://127.0.0.1:19001")
                     self.assertIsInstance(stack.proxy, GenerateFaultProxy)
                     self.assertTrue(stack.data_dir.is_dir())
+                    self.assertEqual(stack._node_container, f"{stack.prefix}-zakura")
+                    self.assertEqual(
+                        stack._lightwalletd_container,
+                        f"{stack.prefix}-lightwalletd",
+                    )
                     environment = popen.call_args.kwargs["env"]
                     self.assertEqual(environment["TSZ_ZAKURA_RPC"], stack.proxy.url)
                     self.assertEqual(environment["TSZ_LIGHTWALLETD"], "http://127.0.0.1:19067")
@@ -368,6 +456,8 @@ class RegtestStackCleanupTests(unittest.TestCase):
                 commands.append(command)
                 if command[:3] == ["docker", "volume", "create"] and command[-1].endswith("-lightwalletd"):
                     raise subprocess.CalledProcessError(19, command)
+                if command[:4] == ["docker", "volume", "rm", "-f"]:
+                    return subprocess.CompletedProcess(command, 1, stdout="")
                 return subprocess.CompletedProcess(command, 0, stdout="")
 
             with patch("regtest_support.subprocess.run", side_effect=fake_run):
@@ -375,6 +465,10 @@ class RegtestStackCleanupTests(unittest.TestCase):
                     stack.__enter__()
 
             self.assertEqual(failure.exception.returncode, 19)
+            self.assertEqual(
+                getattr(failure.exception, "__notes__", ()),
+                ["regtest cleanup failed: chain volume: failed to remove owned Docker volume"],
+            )
             chain = f"{stack.prefix}-chain"
             self.assertEqual(
                 [command for command in commands if command[:3] in (["docker", "volume", "rm"], ["docker", "network", "rm"])],
@@ -386,6 +480,39 @@ class RegtestStackCleanupTests(unittest.TestCase):
             cleanup_commands = list(commands)
             stack.close()
             self.assertEqual(commands, cleanup_commands)
+
+    def test_body_failure_keeps_original_error_and_reports_all_cleanup_failures(self):
+        stack = RegtestStack(Path("/test-only/tsz-server"))
+        cleanup_calls = []
+
+        def first_failed_removal():
+            cleanup_calls.append("first failed removal")
+            raise RuntimeError("first remove failed")
+
+        def second_failed_removal():
+            cleanup_calls.append("second failed removal")
+            raise RuntimeError("second remove failed")
+
+        stack._register_cleanup("later cleanup", lambda: cleanup_calls.append("later cleanup"))
+        stack._register_cleanup("second failing removal", second_failed_removal)
+        stack._register_cleanup("first failing removal", first_failed_removal)
+        with patch.object(stack, "_setup"):
+            with self.assertRaisesRegex(ValueError, "test body failed") as failure:
+                with stack:
+                    raise ValueError("test body failed")
+
+        self.assertEqual(
+            cleanup_calls,
+            ["first failed removal", "second failed removal", "later cleanup"],
+        )
+        self.assertEqual(str(failure.exception), "test body failed")
+        self.assertEqual(
+            getattr(failure.exception, "__notes__", ()),
+            [
+                "regtest cleanup failed: first failing removal: first remove failed",
+                "regtest cleanup failed: second failing removal: second remove failed",
+            ],
+        )
 
 
 if __name__ == "__main__":

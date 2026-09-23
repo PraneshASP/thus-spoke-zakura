@@ -215,10 +215,15 @@ class RegtestStack:
         self.proxy: GenerateFaultProxy | None = None
         self.data_dir: Path | None = None
         self.cleanup_errors: list[str] = []
+        self._cleanup_errors_reported = False
         self._cleanup_actions: list[tuple[str, Callable[[], None]]] = []
         self._cleanup_lock = threading.Lock()
         self._closed = False
         self._process: subprocess.Popen[bytes] | None = None
+        self._node_container: str | None = None
+        self._lightwalletd_container: str | None = None
+        self._api_port: int | None = None
+        self._serve_stderr_path: Path | None = None
         self._temporary_directory: tempfile.TemporaryDirectory[str] | None = None
         self._previous_signals: dict[int, Any] = {}
 
@@ -227,14 +232,18 @@ class RegtestStack:
             self._install_signal_handlers()
             self._setup()
             return self
-        except BaseException:
+        except BaseException as error:
             self.close()
+            self._attach_cleanup_errors(error)
             raise
 
     def __exit__(self, exc_type, exc, traceback):
         self.close()
-        if exc_type is None and self.cleanup_errors:
-            raise RuntimeError("regtest cleanup failed: " + "; ".join(self.cleanup_errors))
+        if self.cleanup_errors:
+            if exc is not None:
+                self._attach_cleanup_errors(exc)
+            else:
+                raise RuntimeError("regtest cleanup failed: " + "; ".join(self.cleanup_errors))
         return False
 
     def _setup(self):
@@ -266,6 +275,8 @@ class RegtestStack:
         lightwalletd_volume = f"{self.prefix}-lightwalletd"
         node_container = f"{self.prefix}-zakura"
         lightwalletd_container = f"{self.prefix}-lightwalletd"
+        self._node_container = node_container
+        self._lightwalletd_container = lightwalletd_container
 
         self._docker(["network", "create", self.prefix])
         self._register_cleanup("network", lambda: self._remove_docker("network", self.prefix))
@@ -351,7 +362,8 @@ class RegtestStack:
 
         self.proxy = GenerateFaultProxy(self.node_url).__enter__()
         self._register_cleanup("generate proxy", self.proxy.close)
-        api_port = self._unused_loopback_port()
+        api_port = self._select_loopback_port()
+        self._api_port = api_port
         self.api_url = f"http://127.0.0.1:{api_port}"
         environment = os.environ.copy()
         environment.update(
@@ -362,12 +374,19 @@ class RegtestStack:
                 "TSZ_LISTEN": f"127.0.0.1:{api_port}",
             }
         )
-        self._process = subprocess.Popen(
-            [str(self.server), "serve", "--data-dir", str(self.data_dir)],
-            env=environment,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+        self._serve_stderr_path = root / "serve.stderr"
+        stderr_fd = os.open(
+            self._serve_stderr_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
         )
+        with os.fdopen(stderr_fd, "wb") as serve_stderr:
+            self._process = subprocess.Popen(
+                [str(self.server), "serve", "--data-dir", str(self.data_dir)],
+                env=environment,
+                stdout=subprocess.DEVNULL,
+                stderr=serve_stderr,
+            )
         self._register_cleanup("server process", self._stop_process)
         wait_until(self._funded_server_ready, timeout=300, label="funded server startup")
 
@@ -423,6 +442,7 @@ class RegtestStack:
 
     def _funded_server_ready(self):
         self._server_running()
+        self.assert_owned_containers_running()
         try:
             health = request_json(self.api_url, "/api/v1/health")
             status = request_json(self.api_url, "/api/v1/status")
@@ -440,17 +460,43 @@ class RegtestStack:
             return False
         return health
 
+    def assert_owned_containers_running(self):
+        """Fail immediately when an owned runtime container exits."""
+        for container in (self._node_container, self._lightwalletd_container):
+            if container is None:
+                raise RuntimeError("fixture container was not started")
+            self._container_running(container)
+
     def _server_running(self):
         if self._process is None:
             raise RuntimeError("server process was not started")
         exit_code = self._process.poll()
         if exit_code is not None:
+            if self._serve_lost_api_port():
+                raise RuntimeError(
+                    f"server could not bind fixture API port {self._api_port} "
+                    "because it is already in use"
+                )
             raise RuntimeError(f"server exited during fixture setup with status {exit_code}")
 
-    def _unused_loopback_port(self) -> int:
+    def _select_loopback_port(self) -> int:
+        """Select a fresh port and diagnose the unavoidable child-bind race safely."""
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
             listener.bind(("127.0.0.1", 0))
             return listener.getsockname()[1]
+
+    def _serve_lost_api_port(self) -> bool:
+        if self._api_port is None or self._serve_stderr_path is None:
+            return False
+        try:
+            with self._serve_stderr_path.open("rb") as serve_stderr:
+                diagnostics = serve_stderr.read(64 * 1024).lower()
+        except OSError:
+            return False
+        return any(
+            marker in diagnostics
+            for marker in (b"address already in use", b"eaddrinuse", b"os error 98")
+        )
 
     def _stop_process(self):
         if self._process is None or self._process.poll() is not None:
@@ -502,3 +548,10 @@ class RegtestStack:
                 action()
             except Exception as error:
                 self.cleanup_errors.append(f"{label}: {error}")
+
+    def _attach_cleanup_errors(self, original: BaseException):
+        if self._cleanup_errors_reported:
+            return
+        for cleanup_error in self.cleanup_errors:
+            original.add_note(f"regtest cleanup failed: {cleanup_error}")
+        self._cleanup_errors_reported = True
