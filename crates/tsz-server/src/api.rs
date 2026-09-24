@@ -870,11 +870,7 @@ async fn address(
     State(state): State<AppState>,
     Path(address): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    if !address.starts_with('t') {
-        return Err(ApiError::bad_request(
-            "only transparent addresses have public explorer activity",
-        ));
-    }
+    require_transparent_address(&address)?;
     let balance: Value = state
         .0
         .rpc
@@ -1001,6 +997,15 @@ fn require_faucet_address(value: &str) -> ApiResult<()> {
         )),
         None => Err(ApiError::bad_request(
             "destination is not a valid Regtest address",
+        )),
+    }
+}
+
+fn require_transparent_address(value: &str) -> ApiResult<()> {
+    match Address::decode(&regtest_network(), value) {
+        Some(Address::Transparent(_)) => Ok(()),
+        _ => Err(ApiError::bad_request(
+            "only transparent addresses have public explorer activity",
         )),
     }
 }
@@ -1299,6 +1304,23 @@ mod tests {
         assert!(require_faucet_address(&account.unified_address).is_ok());
         assert!(require_faucet_address(&account.transparent_address).is_ok());
         assert!(require_faucet_address("not-an-address").is_err());
+    }
+
+    #[tokio::test]
+    async fn explorer_rejects_malformed_addresses_before_reaching_zakura() {
+        let (state, _dir) = state_with_local_wallet();
+        let account = state.0.store.account(1).unwrap();
+        assert!(require_transparent_address(&account.transparent_address).is_ok());
+
+        let response = router(state)
+            .oneshot(
+                Request::get("/api/v1/addresses/tmOOOOOOOOOOOOOOOOOOOOOOOO")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
