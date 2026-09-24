@@ -59,5 +59,4 @@ Only change the following when required by the task. Explain the compatibility o
 
 ## Git
 
-- Branch from `main` and use Conventional Commits, for example `fix(cli): ...`, `feat(web): ...`, or `docs: ...`.
-- Fill in `.github/pull_request_template.md` when opening a pull request.
+Use Conventional Commits, for example `fix(cli): ...` or `feat(web): ...`. Follow the Pull requests section in `CONTRIBUTING.md`.

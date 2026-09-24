@@ -41,6 +41,7 @@ CI runs the following. Run them locally before opening a pull request:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
+cargo test -p thus-spoke-zakura --features release-distribution
 npm run lint --prefix web
 npm run format:check --prefix web
 npm test --prefix web
