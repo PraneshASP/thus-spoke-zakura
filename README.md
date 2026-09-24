@@ -177,6 +177,63 @@ npm test --prefix web
 npm run build --prefix web
 ```
 
+### Activity-recovery integration test
+
+The `activity-recovery` CI job runs the real recovery regression on Linux for
+every push and pull request. It is separate from the normal Rust and web jobs:
+`cargo test --workspace` is Docker-free and cannot establish that this live
+scenario works.
+
+Run the following from the repository root. It requires Rust 1.98.0, a running
+Docker daemon, network access to pull `zakuracore/zakura:1.4.0`, and enough
+local CPU, memory, and time to build the existing pinned lightwalletd image and
+create a real Orchard proof. The Rust Cargo integration target is the only test
+runner: the normal Cargo invocation runs Docker-free helper tests while the
+live test remains ignored until explicitly selected. The node and lightwalletd
+remain real external services for that explicit invocation.
+
+```console
+cargo test --locked --profile dev-runtime -p tsz-server --test activity_recovery --no-run
+cargo test --locked --profile dev-runtime -p tsz-server --test activity_recovery
+# The preceding command runs helper tests; the live test remains ignored.
+docker pull zakuracore/zakura:1.4.0
+docker build -f docker/lightwalletd.Dockerfile -t tsz-recovery-lightwalletd:local .
+cargo test --locked --profile dev-runtime -p tsz-server --test activity_recovery -- --ignored --exact broadcast_recovers_after_auto_mine_failure
+```
+
+The first command compiles the integration target. The second runs its
+Docker-free helper coverage and leaves the ignored live regression unexecuted.
+The last command explicitly selects the live regression; Cargo supplies that
+target with the matching source-built `tsz-server` binary, including when
+`CARGO_TARGET_DIR` is set. Do not substitute an installed or older binary.
+
+The live test owns a UUID-prefixed `tsz-recovery-*` Docker network, containers,
+and volumes, plus private temporary data/configuration directories, a local RPC
+proxy, and a local server process. It sends a genuine 1,000,000-zatoshi (0.01
+ZEC) Orchard payment from Account 1 to Account 2, deliberately rejects exactly
+one automatic `generate([1])` through the proxy, mines directly through the
+node, then waits for the production background wallet-sync loop to update the
+existing activity row. Direct mining is intentional: retrying Send or using the
+server's mine endpoint would repair the row through a different path and would
+not prove background recovery.
+
+This is an integration test, not a mocked proof: image pull/build, wallet
+startup, and Orchard proving make it materially slower and more resource-
+intensive than the helper suite. Its fixture removes only exact resources it
+registered, stops and reaps its child server, shuts down the proxy, and returns
+nonzero for a timeout or cleanup failure. It never prunes shared Docker state.
+It suppresses server process output and does not upload raw process logs,
+request bodies, wallet keys, wallet databases, or configuration directories.
+
+To prove the regression is sensitive, perform the negative control only after a
+successful live run and only in an isolated verification worktree. Temporarily
+remove `reconcile_unconfirmed(self).await?;` from
+`AppState::refresh_wallet_snapshot`, rerun the same explicit live Cargo command,
+and require failure at background activity recovery after the broadcast,
+intercepted auto-mine failure, and real inclusion checks. Restore the exact line
+immediately, including after a failed run; do not retain the temporary
+production-code edit.
+
 ## How it fits together
 
 ```text

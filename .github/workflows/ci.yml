@@ -46,3 +46,24 @@ jobs:
       - run: npm run format:check
       - run: npm test
       - run: npm run build
+
+  activity-recovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
+        with:
+          toolchain: 1.98.0
+          components: rustfmt,clippy
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - name: Compile Rust recovery target
+        run: cargo test --locked --profile dev-runtime -p tsz-server --test activity_recovery --no-run
+      - name: Run Docker-free recovery helper tests
+        run: cargo test --locked --profile dev-runtime -p tsz-server --test activity_recovery
+      - name: Pull pinned Zakura node image
+        run: docker pull zakuracore/zakura:1.4.0
+      - name: Build pinned lightwalletd image
+        run: docker build -f docker/lightwalletd.Dockerfile -t tsz-recovery-lightwalletd:local .
+      - name: Run live activity recovery regression
+        run: cargo test --locked --profile dev-runtime -p tsz-server --test activity_recovery -- --ignored --exact broadcast_recovers_after_auto_mine_failure

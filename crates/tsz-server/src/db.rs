@@ -143,6 +143,14 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    pub fn unconfirmed_activities(&self) -> Result<Vec<Activity>> {
+        let db = self.0.lock().unwrap();
+        let mut query = db.prepare("SELECT id,kind,from_account,to_account,source_pool,destination_pool,amount_zatoshi,txid,block_hash,status,created_at FROM activity WHERE status!='confirmed' ORDER BY rowid ASC")?;
+        Ok(query
+            .query_map([], row_activity)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn activity_for_key(&self, key: &str) -> Result<Option<Activity>> {
         let db = self.0.lock().unwrap();
         db.query_row(
@@ -241,6 +249,9 @@ impl Store {
     }
 
     pub fn confirm(&self, id: &str, block_hash: &str) -> Result<Activity> {
+        if block_hash.is_empty() {
+            bail!("block hash is required to confirm activity");
+        }
         let db = self.0.lock().unwrap();
         db.execute(
             "UPDATE activity SET status='confirmed',block_hash=?1 WHERE id=?2",
@@ -439,5 +450,64 @@ mod tests {
             .unwrap();
         assert_eq!(activity.txid, "real-txid");
         assert_eq!(store.account(1).unwrap().transparent_zatoshi, 0);
+    }
+
+    #[test]
+    fn unconfirmed_activities_skips_confirmed_rows() {
+        let store = Store::open(":memory:").unwrap();
+        store.initialize().unwrap();
+        let pending = store
+            .transfer(
+                1,
+                2,
+                "orchard",
+                "orchard",
+                12_000,
+                "pending-key",
+                "txid-pending",
+            )
+            .unwrap();
+        let mined = store
+            .transfer(
+                1,
+                3,
+                "orchard",
+                "orchard",
+                13_000,
+                "mined-key",
+                "txid-mined",
+            )
+            .unwrap();
+        store.confirm(&mined.id, &"c".repeat(64)).unwrap();
+
+        let open = store.unconfirmed_activities().unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].id, pending.id);
+        assert_eq!(open[0].status, "broadcast");
+        assert_eq!(open[0].txid, "txid-pending");
+    }
+
+    #[test]
+    fn confirm_rejects_an_empty_block_hash() {
+        let store = Store::open(":memory:").unwrap();
+        store.initialize().unwrap();
+        let pending = store
+            .transfer(
+                1,
+                2,
+                "orchard",
+                "orchard",
+                12_000,
+                "empty-hash",
+                "txid-empty",
+            )
+            .unwrap();
+        assert!(store.confirm(&pending.id, "").is_err());
+        let again = store
+            .transfer(1, 2, "orchard", "orchard", 12_000, "empty-hash", "ignored")
+            .unwrap();
+        assert_eq!(again.id, pending.id);
+        assert_eq!(again.status, "broadcast");
+        assert_eq!(again.block_hash, None);
     }
 }
