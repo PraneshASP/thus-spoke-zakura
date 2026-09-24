@@ -6,7 +6,7 @@ members = ["crates/tsz-cli", "crates/tsz-server"]
 version = "0.2.1"
 edition = "2024"
 rust-version = "1.91"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 repository = "https://github.com/zcashlabs/thus-spoke-zakura"
 
 [workspace.dependencies]
