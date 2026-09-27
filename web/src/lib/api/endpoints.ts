@@ -9,6 +9,7 @@ import {
   mempoolSchema,
   miningJobSchema,
   miningJobResponseSchema,
+  paymentUriSchema,
   seedSchema,
   sendQuoteSchema,
   statusSchema,
@@ -46,14 +47,16 @@ export const api = {
       z.looseObject({ type: z.enum(['block', 'transaction']) }),
     ),
 
+  /** Exactly one of `to_account` or `to_address` is set. */
   send: (input: {
     from_account: number;
-    to_account: number;
+    to_account?: number;
+    to_address?: string;
     source_pool: Pool;
     destination_pool: Pool;
     amount_zatoshi: bigint;
-    idempotency_key: string;
     memo?: string;
+    idempotency_key: string;
   }) =>
     post('/send', activitySchema, {
       ...input,
@@ -62,6 +65,8 @@ export const api = {
 
   /** Dry-run proposal: exact fee and max spendable; nothing is broadcast. */
   sendQuote: (input: SendQuoteInput) => post('/send/quote', sendQuoteSchema, input),
+
+  parsePaymentUri: (uri: string) => post('/zip321/parse', paymentUriSchema, { uri }),
 
   faucet: (input: {
     account_id: number;
