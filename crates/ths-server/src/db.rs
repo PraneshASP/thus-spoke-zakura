@@ -58,7 +58,8 @@ pub struct Activity {
     pub id: String,
     pub kind: String,
     pub from_account: Option<u8>,
-    pub to_account: u8,
+    pub to_account: Option<u8>,
+    pub to_address: Option<String>,
     pub source_pool: String,
     pub destination_pool: String,
     pub amount_zatoshi: u64,
@@ -74,6 +75,13 @@ pub struct PreparedTransaction {
     pub expiry_height: u64,
 }
 
+/// Where a send is going: a development account, or any other Regtest address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recipient<'a> {
+    Account(u8),
+    Address(&'a str),
+}
+
 #[derive(Clone)]
 pub struct Store(Arc<Mutex<Connection>>);
 
@@ -86,18 +94,13 @@ impl Store {
 
     pub fn initialize(&self) -> Result<()> {
         let db = self.0.lock().unwrap();
-        db.execute_batch(r#"
+        db.execute_batch(
+            r#"
             CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS accounts (
                 id INTEGER PRIMARY KEY, name TEXT NOT NULL, unified_address TEXT NOT NULL,
                 transparent_address TEXT NOT NULL, transparent_zatoshi INTEGER NOT NULL DEFAULT 0,
                 ironwood_zatoshi INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS activity (
-                id TEXT PRIMARY KEY, kind TEXT NOT NULL, from_account INTEGER, to_account INTEGER NOT NULL,
-                source_pool TEXT NOT NULL, destination_pool TEXT NOT NULL, amount_zatoshi INTEGER NOT NULL,
-                txid TEXT NOT NULL, block_hash TEXT, status TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS idempotency (
                 key TEXT PRIMARY KEY, activity_id TEXT NOT NULL, memo TEXT
@@ -106,7 +109,10 @@ impl Store {
                 activity_id TEXT PRIMARY KEY, raw_transaction BLOB NOT NULL,
                 expiry_height INTEGER NOT NULL
             );
-        "#)?;
+        "#,
+        )?;
+        db.execute_batch(ACTIVITY_TABLE)?;
+        migrate_activity_recipients(&db)?;
         let has_memo = db
             .prepare("PRAGMA table_info(idempotency)")?
             .query_map([], |row| row.get::<_, String>(1))?
@@ -179,7 +185,7 @@ impl Store {
 
     pub fn activities(&self, limit: u32) -> Result<Vec<Activity>> {
         let db = self.0.lock().unwrap();
-        let mut query = db.prepare("SELECT id,kind,from_account,to_account,source_pool,destination_pool,amount_zatoshi,txid,block_hash,status,created_at FROM activity WHERE txid != '' ORDER BY rowid DESC LIMIT ?1")?;
+        let mut query = db.prepare("SELECT id,kind,from_account,to_account,to_address,source_pool,destination_pool,amount_zatoshi,txid,block_hash,status,created_at FROM activity WHERE txid != '' ORDER BY rowid DESC LIMIT ?1")?;
         Ok(query
             .query_map([limit.min(100)], row_activity)?
             .collect::<rusqlite::Result<Vec<_>>>()?)
@@ -187,7 +193,7 @@ impl Store {
 
     pub fn unconfirmed_activities(&self) -> Result<Vec<Activity>> {
         let db = self.0.lock().unwrap();
-        let mut query = db.prepare("SELECT id,kind,from_account,to_account,source_pool,destination_pool,amount_zatoshi,txid,block_hash,status,created_at FROM activity WHERE txid!='' AND status!='confirmed' ORDER BY rowid ASC")?;
+        let mut query = db.prepare("SELECT id,kind,from_account,to_account,to_address,source_pool,destination_pool,amount_zatoshi,txid,block_hash,status,created_at FROM activity WHERE txid!='' AND status!='confirmed' ORDER BY rowid ASC")?;
         Ok(query
             .query_map([], row_activity)?
             .collect::<rusqlite::Result<Vec<_>>>()?)
@@ -202,7 +208,7 @@ impl Store {
     pub fn claim_transfer(
         &self,
         from: u8,
-        to: u8,
+        to: Recipient<'_>,
         source_pool: &str,
         destination_pool: &str,
         amount: u64,
@@ -234,7 +240,11 @@ impl Store {
             }
             return Ok(activity);
         }
-        for id in [from, to] {
+        let accounts = match to {
+            Recipient::Account(id) => vec![from, id],
+            Recipient::Address(_) => vec![from],
+        };
+        for id in accounts {
             if !db.query_row(
                 "SELECT EXISTS(SELECT 1 FROM accounts WHERE id=?1)",
                 [id],
@@ -264,7 +274,15 @@ impl Store {
         }
         let mut db = self.0.lock().unwrap();
         if let Some(activity) = activity_for_key(&db, key)? {
-            ensure_same_payment(&activity, "faucet", None, to, "ironwood", pool, amount)?;
+            ensure_same_payment(
+                &activity,
+                "faucet",
+                None,
+                Recipient::Account(to),
+                "ironwood",
+                pool,
+                amount,
+            )?;
             return Ok(activity);
         }
         if !db.query_row(
@@ -275,7 +293,14 @@ impl Store {
             bail!("account {to} does not exist");
         }
         let tx = db.transaction()?;
-        let activity = new_activity("faucet", None, to, "ironwood", pool, amount);
+        let activity = new_activity(
+            "faucet",
+            None,
+            Recipient::Account(to),
+            "ironwood",
+            pool,
+            amount,
+        );
         insert_activity(&tx, &activity, key, None)?;
         tx.commit()?;
         Ok(activity)
@@ -309,7 +334,7 @@ impl Store {
             params![txid, id],
         )?;
         let activity = tx.query_row(
-            "SELECT id,kind,from_account,to_account,source_pool,destination_pool,amount_zatoshi,txid,block_hash,status,created_at FROM activity WHERE id=?1",
+            "SELECT id,kind,from_account,to_account,to_address,source_pool,destination_pool,amount_zatoshi,txid,block_hash,status,created_at FROM activity WHERE id=?1",
             [id],
             row_activity,
         )?;
@@ -358,7 +383,7 @@ impl Store {
             tx.execute("DELETE FROM prepared_payments WHERE activity_id=?1", [id])?;
         }
         let activity = tx.query_row(
-            "SELECT id,kind,from_account,to_account,source_pool,destination_pool,amount_zatoshi,txid,block_hash,status,created_at FROM activity WHERE id=?1",
+            "SELECT id,kind,from_account,to_account,to_address,source_pool,destination_pool,amount_zatoshi,txid,block_hash,status,created_at FROM activity WHERE id=?1",
             [id],
             row_activity,
         )?;
@@ -373,7 +398,7 @@ impl Store {
             params![id, txid],
         )?;
         let activity = db.query_row(
-            "SELECT id,kind,from_account,to_account,source_pool,destination_pool,amount_zatoshi,txid,block_hash,status,created_at FROM activity WHERE id=?1",
+            "SELECT id,kind,from_account,to_account,to_address,source_pool,destination_pool,amount_zatoshi,txid,block_hash,status,created_at FROM activity WHERE id=?1",
             [id],
             row_activity,
         )?;
@@ -392,7 +417,7 @@ impl Store {
             "UPDATE activity SET status='confirmed',block_hash=?1 WHERE id=?2 AND txid=?3",
             params![block_hash, id, txid],
         )?;
-        db.query_row("SELECT id,kind,from_account,to_account,source_pool,destination_pool,amount_zatoshi,txid,block_hash,status,created_at FROM activity WHERE id=?1", [id], row_activity).map_err(Into::into)
+        db.query_row("SELECT id,kind,from_account,to_account,to_address,source_pool,destination_pool,amount_zatoshi,txid,block_hash,status,created_at FROM activity WHERE id=?1", [id], row_activity).map_err(Into::into)
     }
 
     pub fn seed(&self) -> Result<String> {
@@ -433,8 +458,42 @@ impl Store {
     }
 }
 
+const ACTIVITY_TABLE: &str = r#"
+    CREATE TABLE IF NOT EXISTS activity (
+        id TEXT PRIMARY KEY, kind TEXT NOT NULL, from_account INTEGER, to_account INTEGER,
+        to_address TEXT, source_pool TEXT NOT NULL, destination_pool TEXT NOT NULL,
+        amount_zatoshi INTEGER NOT NULL, txid TEXT NOT NULL, block_hash TEXT, status TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+"#;
+
+/// Databases created before address sends have `to_account NOT NULL` and no
+/// `to_address`. SQLite cannot relax a constraint in place, so rebuild the
+/// table, keeping rowid order because activity is listed by rowid.
+fn migrate_activity_recipients(db: &Connection) -> Result<()> {
+    let migrated: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('activity') WHERE name='to_address')",
+        [],
+        |r| r.get(0),
+    )?;
+    if migrated {
+        return Ok(());
+    }
+    let tx = db.unchecked_transaction()?;
+    tx.execute_batch("ALTER TABLE activity RENAME TO activity_before_recipients;")?;
+    tx.execute_batch(ACTIVITY_TABLE)?;
+    tx.execute_batch(
+        "INSERT INTO activity(id,kind,from_account,to_account,source_pool,destination_pool,amount_zatoshi,txid,block_hash,status,created_at)
+         SELECT id,kind,from_account,to_account,source_pool,destination_pool,amount_zatoshi,txid,block_hash,status,created_at
+         FROM activity_before_recipients ORDER BY rowid;
+         DROP TABLE activity_before_recipients;",
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn insert_activity(db: &Connection, a: &Activity, key: &str, memo: Option<&str>) -> Result<()> {
-    db.execute("INSERT INTO activity(id,kind,from_account,to_account,source_pool,destination_pool,amount_zatoshi,txid,status) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)", params![a.id,a.kind,a.from_account,a.to_account,a.source_pool,a.destination_pool,a.amount_zatoshi,a.txid,a.status])?;
+    db.execute("INSERT INTO activity(id,kind,from_account,to_account,to_address,source_pool,destination_pool,amount_zatoshi,txid,status) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", params![a.id,a.kind,a.from_account,a.to_account,a.to_address,a.source_pool,a.destination_pool,a.amount_zatoshi,a.txid,a.status])?;
     db.execute(
         "INSERT INTO idempotency(key,activity_id,memo) VALUES(?1,?2,?3)",
         params![key, a.id, memo],
@@ -444,7 +503,7 @@ fn insert_activity(db: &Connection, a: &Activity, key: &str, memo: Option<&str>)
 
 fn activity_for_key(db: &Connection, key: &str) -> Result<Option<Activity>> {
     db.query_row(
-        "SELECT a.id,a.kind,a.from_account,a.to_account,a.source_pool,a.destination_pool,a.amount_zatoshi,a.txid,a.block_hash,a.status,a.created_at FROM activity a JOIN idempotency i ON i.activity_id=a.id WHERE i.key=?1",
+        "SELECT a.id,a.kind,a.from_account,a.to_account,a.to_address,a.source_pool,a.destination_pool,a.amount_zatoshi,a.txid,a.block_hash,a.status,a.created_at FROM activity a JOIN idempotency i ON i.activity_id=a.id WHERE i.key=?1",
         [key],
         row_activity,
     )
@@ -454,7 +513,7 @@ fn activity_for_key(db: &Connection, key: &str) -> Result<Option<Activity>> {
 fn new_activity(
     kind: &str,
     from: Option<u8>,
-    to: u8,
+    to: Recipient<'_>,
     source: &str,
     destination: &str,
     amount: u64,
@@ -464,7 +523,14 @@ fn new_activity(
         id,
         kind: kind.into(),
         from_account: from,
-        to_account: to,
+        to_account: match to {
+            Recipient::Account(id) => Some(id),
+            Recipient::Address(_) => None,
+        },
+        to_address: match to {
+            Recipient::Account(_) => None,
+            Recipient::Address(address) => Some(address.to_owned()),
+        },
         source_pool: source.into(),
         destination_pool: destination.into(),
         amount_zatoshi: amount,
@@ -487,14 +553,19 @@ fn ensure_same_payment(
     activity: &Activity,
     kind: &str,
     from: Option<u8>,
-    to: u8,
+    to: Recipient<'_>,
     source_pool: &str,
     destination_pool: &str,
     amount: u64,
 ) -> Result<()> {
+    let (to_account, to_address) = match to {
+        Recipient::Account(id) => (Some(id), None),
+        Recipient::Address(address) => (None, Some(address)),
+    };
     if activity.kind != kind
         || activity.from_account != from
-        || activity.to_account != to
+        || activity.to_account != to_account
+        || activity.to_address.as_deref() != to_address
         || activity.source_pool != source_pool
         || activity.destination_pool != destination_pool
         || activity.amount_zatoshi != amount
@@ -520,13 +591,14 @@ fn row_activity(row: &rusqlite::Row<'_>) -> rusqlite::Result<Activity> {
         kind: row.get(1)?,
         from_account: row.get(2)?,
         to_account: row.get(3)?,
-        source_pool: row.get(4)?,
-        destination_pool: row.get(5)?,
-        amount_zatoshi: row.get(6)?,
-        txid: row.get(7)?,
-        block_hash: row.get(8)?,
-        status: row.get(9)?,
-        created_at: row.get(10)?,
+        to_address: row.get(4)?,
+        source_pool: row.get(5)?,
+        destination_pool: row.get(6)?,
+        amount_zatoshi: row.get(7)?,
+        txid: row.get(8)?,
+        block_hash: row.get(9)?,
+        status: row.get(10)?,
+        created_at: row.get(11)?,
     })
 }
 fn derived_full_viewing_key(seed: &[u8], id: u8) -> Result<UnifiedFullViewingKey> {
@@ -740,7 +812,15 @@ mod tests {
         let store = Store::open(":memory:").unwrap();
         store.initialize().unwrap();
         let activity = store
-            .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "send", None)
+            .claim_transfer(
+                1,
+                Recipient::Account(2),
+                "ironwood",
+                "ironwood",
+                12_000,
+                "send",
+                None,
+            )
             .unwrap();
         let activity = store
             .record_prepared(&activity.id, "real-txid", b"raw transaction", 140)
@@ -755,17 +835,41 @@ mod tests {
         let store = Store::open(":memory:").unwrap();
         store.initialize().unwrap();
         store
-            .claim_transfer(1, 2, "ironwood", "ironwood", 11_000, "preparing-key", None)
+            .claim_transfer(
+                1,
+                Recipient::Account(2),
+                "ironwood",
+                "ironwood",
+                11_000,
+                "preparing-key",
+                None,
+            )
             .unwrap();
         let pending = store
-            .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "pending-key", None)
+            .claim_transfer(
+                1,
+                Recipient::Account(2),
+                "ironwood",
+                "ironwood",
+                12_000,
+                "pending-key",
+                None,
+            )
             .unwrap();
         let pending = store
             .record_prepared(&pending.id, "txid-pending", b"pending", 140)
             .unwrap();
         let pending = store.mark_broadcast(&pending.id, &pending.txid).unwrap();
         let mined = store
-            .claim_transfer(1, 3, "ironwood", "ironwood", 13_000, "mined-key", None)
+            .claim_transfer(
+                1,
+                Recipient::Account(3),
+                "ironwood",
+                "ironwood",
+                13_000,
+                "mined-key",
+                None,
+            )
             .unwrap();
         let mined = store
             .record_prepared(&mined.id, "txid-mined", b"mined", 140)
@@ -787,7 +891,15 @@ mod tests {
         let store = Store::open(":memory:").unwrap();
         store.initialize().unwrap();
         let pending = store
-            .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "empty-hash", None)
+            .claim_transfer(
+                1,
+                Recipient::Account(2),
+                "ironwood",
+                "ironwood",
+                12_000,
+                "empty-hash",
+                None,
+            )
             .unwrap();
         let pending = store
             .record_prepared(&pending.id, "txid-empty", b"raw", 140)
@@ -796,7 +908,15 @@ mod tests {
 
         assert!(store.confirm(&pending.id, &pending.txid, "").is_err());
         let again = store
-            .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "empty-hash", None)
+            .claim_transfer(
+                1,
+                Recipient::Account(2),
+                "ironwood",
+                "ironwood",
+                12_000,
+                "empty-hash",
+                None,
+            )
             .unwrap();
         assert_eq!(again.id, pending.id);
         assert_eq!(again.status, "broadcast");
@@ -808,11 +928,27 @@ mod tests {
         let store = Store::open(":memory:").unwrap();
         store.initialize().unwrap();
         store
-            .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "same", None)
+            .claim_transfer(
+                1,
+                Recipient::Account(2),
+                "ironwood",
+                "ironwood",
+                12_000,
+                "same",
+                None,
+            )
             .unwrap();
 
         let error = store
-            .claim_transfer(1, 2, "ironwood", "ironwood", 13_000, "same", None)
+            .claim_transfer(
+                1,
+                Recipient::Account(2),
+                "ironwood",
+                "ironwood",
+                13_000,
+                "same",
+                None,
+            )
             .unwrap_err();
 
         assert!(error.to_string().contains("different payment"));
@@ -831,7 +967,7 @@ mod tests {
         let first = store
             .claim_transfer(
                 1,
-                2,
+                Recipient::Account(2),
                 "ironwood",
                 "ironwood",
                 12_000,
@@ -843,7 +979,7 @@ mod tests {
             store
                 .claim_transfer(
                     1,
-                    2,
+                    Recipient::Account(2),
                     "ironwood",
                     "ironwood",
                     12_000,
@@ -856,7 +992,15 @@ mod tests {
         );
         for memo in [None, Some(""), Some("gift")] {
             let error = store
-                .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "memo-key", memo)
+                .claim_transfer(
+                    1,
+                    Recipient::Account(2),
+                    "ironwood",
+                    "ironwood",
+                    12_000,
+                    "memo-key",
+                    memo,
+                )
                 .unwrap_err();
             assert!(error.downcast_ref::<IdempotencyConflict>().is_some());
         }
@@ -877,7 +1021,7 @@ mod tests {
         store
             .claim_transfer(
                 1,
-                2,
+                Recipient::Account(2),
                 "ironwood",
                 "ironwood",
                 12_000,
@@ -912,7 +1056,15 @@ mod tests {
                 std::thread::spawn(move || {
                     barrier.wait();
                     store
-                        .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "same", None)
+                        .claim_transfer(
+                            1,
+                            Recipient::Account(2),
+                            "ironwood",
+                            "ironwood",
+                            12_000,
+                            "same",
+                            None,
+                        )
                         .unwrap()
                 })
             })
@@ -932,14 +1084,30 @@ mod tests {
         let store = Store::open(":memory:").unwrap();
         store.initialize().unwrap();
         let failed = store
-            .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "same", None)
+            .claim_transfer(
+                1,
+                Recipient::Account(2),
+                "ironwood",
+                "ironwood",
+                12_000,
+                "same",
+                None,
+            )
             .unwrap();
 
         store.discard_preparing(&failed.id).unwrap();
 
         assert!(store.activity_for_key("same").unwrap().is_none());
         let retry = store
-            .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "same", None)
+            .claim_transfer(
+                1,
+                Recipient::Account(2),
+                "ironwood",
+                "ironwood",
+                12_000,
+                "same",
+                None,
+            )
             .unwrap();
         assert_ne!(retry.id, failed.id);
     }
@@ -949,7 +1117,15 @@ mod tests {
         let store = Store::open(":memory:").unwrap();
         store.initialize().unwrap();
         let claim = store
-            .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "same", None)
+            .claim_transfer(
+                1,
+                Recipient::Account(2),
+                "ironwood",
+                "ironwood",
+                12_000,
+                "same",
+                None,
+            )
             .unwrap();
         store
             .record_prepared(&claim.id, "expired-txid", b"signed transaction", 140)
@@ -968,7 +1144,15 @@ mod tests {
         let store = Store::open(":memory:").unwrap();
         store.initialize().unwrap();
         let claim = store
-            .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "same", None)
+            .claim_transfer(
+                1,
+                Recipient::Account(2),
+                "ironwood",
+                "ironwood",
+                12_000,
+                "same",
+                None,
+            )
             .unwrap();
         let first = store
             .record_prepared(&claim.id, "real-txid", b"signed transaction", 140)
@@ -988,7 +1172,15 @@ mod tests {
         let store = Store::open(":memory:").unwrap();
         store.initialize().unwrap();
         let claim = store
-            .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "same", None)
+            .claim_transfer(
+                1,
+                Recipient::Account(2),
+                "ironwood",
+                "ironwood",
+                12_000,
+                "same",
+                None,
+            )
             .unwrap();
         let prepared = store
             .record_prepared(&claim.id, "real-txid", b"signed transaction", 140)
@@ -1024,7 +1216,15 @@ mod tests {
         let store = Store::open(":memory:").unwrap();
         store.initialize().unwrap();
         let claim = store
-            .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "same", None)
+            .claim_transfer(
+                1,
+                Recipient::Account(2),
+                "ironwood",
+                "ironwood",
+                12_000,
+                "same",
+                None,
+            )
             .unwrap();
         store
             .record_prepared(&claim.id, "old-txid", b"old transaction", 140)
@@ -1045,7 +1245,15 @@ mod tests {
         let store = Store::open(":memory:").unwrap();
         store.initialize().unwrap();
         let claim = store
-            .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "same", None)
+            .claim_transfer(
+                1,
+                Recipient::Account(2),
+                "ironwood",
+                "ironwood",
+                12_000,
+                "same",
+                None,
+            )
             .unwrap();
         store
             .record_prepared(&claim.id, "real-txid", b"transaction", 140)
@@ -1067,7 +1275,15 @@ mod tests {
         let store = Store::open(&path).unwrap();
         store.initialize().unwrap();
         let claim = store
-            .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "same", None)
+            .claim_transfer(
+                1,
+                Recipient::Account(2),
+                "ironwood",
+                "ironwood",
+                12_000,
+                "same",
+                None,
+            )
             .unwrap();
         let id = claim.id.clone();
         store
@@ -1078,7 +1294,15 @@ mod tests {
         let reopened = Store::open(path).unwrap();
         reopened.initialize().unwrap();
         let recovered = reopened
-            .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "same", None)
+            .claim_transfer(
+                1,
+                Recipient::Account(2),
+                "ironwood",
+                "ironwood",
+                12_000,
+                "same",
+                None,
+            )
             .unwrap();
 
         assert_eq!(recovered.txid, "real-txid");
@@ -1086,5 +1310,100 @@ mod tests {
         let prepared = reopened.prepared_transaction(&id).unwrap();
         assert_eq!(prepared.raw_transaction, b"raw transaction");
         assert_eq!(prepared.expiry_height, 140);
+    }
+
+    #[test]
+    fn records_a_send_to_an_external_address() {
+        let store = Store::open(":memory:").unwrap();
+        store.initialize().unwrap();
+        let activity = store
+            .claim_transfer(
+                1,
+                Recipient::Address("tmExternal"),
+                "ironwood",
+                "transparent",
+                12_000,
+                "external-key",
+                None,
+            )
+            .unwrap();
+        assert_eq!(activity.to_account, None);
+        assert_eq!(activity.to_address.as_deref(), Some("tmExternal"));
+
+        let replayed = store
+            .claim_transfer(
+                1,
+                Recipient::Address("tmExternal"),
+                "ironwood",
+                "transparent",
+                12_000,
+                "external-key",
+                None,
+            )
+            .unwrap();
+        assert_eq!(replayed.id, activity.id);
+
+        // Reusing the key for a different recipient is a different payment.
+        let conflict = store
+            .claim_transfer(
+                1,
+                Recipient::Address("tmOther"),
+                "ironwood",
+                "transparent",
+                12_000,
+                "external-key",
+                None,
+            )
+            .unwrap_err();
+        assert!(conflict.downcast_ref::<IdempotencyConflict>().is_some());
+    }
+
+    #[test]
+    fn migrates_activity_created_before_address_sends() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.db");
+        {
+            let db = Connection::open(&path).unwrap();
+            db.execute_batch(
+                "CREATE TABLE activity (
+                     id TEXT PRIMARY KEY, kind TEXT NOT NULL, from_account INTEGER,
+                     to_account INTEGER NOT NULL, source_pool TEXT NOT NULL,
+                     destination_pool TEXT NOT NULL, amount_zatoshi INTEGER NOT NULL,
+                     txid TEXT NOT NULL, block_hash TEXT, status TEXT NOT NULL,
+                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                 );
+                 INSERT INTO activity(id,kind,from_account,to_account,source_pool,destination_pool,amount_zatoshi,txid,status)
+                 VALUES('older','send',1,2,'ironwood','ironwood',1,'txid-older','confirmed'),
+                       ('newer','send',1,3,'ironwood','ironwood',2,'txid-newer','broadcast');",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        store.initialize().unwrap();
+        let activity = store.activities(10).unwrap();
+        assert_eq!(
+            activity.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
+            ["newer", "older"]
+        );
+        assert_eq!(activity[0].to_account, Some(3));
+        assert_eq!(activity[0].to_address, None);
+
+        store
+            .claim_transfer(
+                1,
+                Recipient::Address("tmExternal"),
+                "ironwood",
+                "transparent",
+                3,
+                "after-migration",
+                None,
+            )
+            .unwrap();
+        // Initializing again must keep rows written after the migration.
+        store.initialize().unwrap();
+        let claimed = store.activity_for_key("after-migration").unwrap().unwrap();
+        assert_eq!(claimed.to_address.as_deref(), Some("tmExternal"));
+        assert_eq!(store.activities(10).unwrap().len(), 2);
     }
 }
