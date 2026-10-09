@@ -1,5 +1,5 @@
 import { zodResolver } from '@hookform/resolvers/zod';
-import { useForm } from 'react-hook-form';
+import { useForm, useWatch } from 'react-hook-form';
 import { Dialog } from '@/components/ui/Dialog';
 import { Button } from '@/components/ui/Button';
 import { Field } from '@/components/ui/Field';
@@ -34,12 +34,20 @@ export function FaucetDialog({
     // once the subsidy has halved.
     defaultValues: { account_id: String(defaultAccountId ?? 1), pool: 'ironwood', amount: '1' },
   });
+  const current = faucetSchema.safeParse(useWatch({ control: form.control }));
+  const pendingForCurrent =
+    current.success &&
+    faucet.data?.activity.status !== 'confirmed' &&
+    faucet.data?.activity.to_account === current.data.account_id &&
+    faucet.data?.activity.destination_pool === current.data.pool &&
+    faucet.data?.activity.amount_zatoshi === current.data.amount;
 
   const submit = form.handleSubmit((values) => {
     faucet.mutate(
       { account_id: values.account_id, pool: values.pool, amount_zatoshi: values.amount },
       {
-        onSuccess: (activity) => {
+        onSuccess: ({ activity }) => {
+          if (activity.status !== 'confirmed') return;
           toast.success(
             `Funded Account ${values.account_id}`,
             `${formatZecAmount(activity.amount_zatoshi)} confirmed.`,
@@ -91,6 +99,12 @@ export function FaucetDialog({
           )}
         </Field>
 
+        {pendingForCurrent && (
+          <p role="status">
+            Payment is pending. Submit the same details again to check the original transaction.
+          </p>
+        )}
+
         <Button
           type="submit"
           variant="primary"
@@ -98,7 +112,7 @@ export function FaucetDialog({
           loading={faucet.isPending}
           disabled={!form.formState.isValid || faucet.isPending}
         >
-          {faucet.isPending ? 'Requesting…' : 'Add funds'}
+          {faucet.isPending ? 'Requesting…' : pendingForCurrent ? 'Check payment' : 'Add funds'}
         </Button>
       </form>
     </Dialog>

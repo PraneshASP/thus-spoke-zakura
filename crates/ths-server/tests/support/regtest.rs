@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use reqwest::{Client, redirect::Policy};
 use serde::{Deserialize, de::DeserializeOwned};
@@ -299,6 +299,7 @@ pub struct RegtestStack {
     server_child: Option<Child>,
     node_url: String,
     api_url: String,
+    lightwalletd_port: Option<u16>,
     start_attempted: bool,
     shutdown_complete: bool,
     cleanup_errors: Vec<String>,
@@ -350,6 +351,7 @@ impl RegtestStack {
             server_child: None,
             node_url: String::new(),
             api_url: String::new(),
+            lightwalletd_port: None,
             start_attempted: false,
             shutdown_complete: false,
             cleanup_errors: Vec::new(),
@@ -505,6 +507,7 @@ impl RegtestStack {
             .inspect_container(&self.names.lightwalletd_container)
             .await?;
         let lightwalletd_port = published_loopback_port(&lightwalletd_inspect, "9067/tcp")?;
+        self.lightwalletd_port = Some(lightwalletd_port);
 
         self.cleanup.push(CleanupResource::Proxy);
         self.proxy = Some(GenerateFaultProxy::start(self.node_url.clone()).await?);
@@ -517,6 +520,22 @@ impl RegtestStack {
 
     pub fn api_url(&self) -> &str {
         &self.api_url
+    }
+
+    pub async fn restart_server(&mut self) -> Result<()> {
+        let api_port = self
+            .api_url
+            .rsplit(':')
+            .next()
+            .context("fixture API port is missing")?
+            .parse()?;
+        let lightwalletd_port = self
+            .lightwalletd_port
+            .context("fixture lightwalletd port is missing")?;
+        self.stop_server().await?;
+        self.server_exit_code = None;
+        self.spawn_server(api_port, lightwalletd_port).await?;
+        self.wait_for_funded_server().await
     }
 
     pub fn node_url(&self) -> &str {

@@ -213,6 +213,8 @@ Running `ths` with no command starts the default environment.
 | `ths logs app -f` | Follow dashboard/server logs |
 | `ths logs zakura -f` | Follow node logs |
 | `ths logs lightwalletd -f` | Follow lightwalletd logs |
+| `ths logs --tail 200 -f` | Print the last 200 app log lines, then follow |
+| `ths logs zakura --head 200` | Print the first 200 node log lines |
 | `ths list` | List known environments |
 | `ths stop` | Stop and delete the environment |
 | `ths reset --force` | Force-delete one environment and all its data |
@@ -301,12 +303,15 @@ docker pull zakuracore/zakura:1.6.0
 docker build -f docker/lightwalletd.Dockerfile -t ths-recovery-lightwalletd:local .
 cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact broadcast_recovers_after_auto_mine_failure
 cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact concurrent_identical_sends_have_one_chain_effect
+cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact internal_address_faucets_record_confirmed_activity
+cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact internal_address_faucet_recovers_after_auto_mine_failure
+cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact external_address_faucet_behavior_is_unchanged
 cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact same_account_cross_pool_round_trip_is_replay_safe
 ```
 
 The first command compiles the integration target. The second runs its
 Docker-free helper coverage and leaves the ignored live regression unexecuted.
-The last three commands explicitly select the live regressions; Cargo supplies that
+The remaining Cargo commands explicitly select the live regressions; Cargo supplies that
 target with the matching source-built `ths-server` binary, including when
 `CARGO_TARGET_DIR` is set. Do not substitute an installed or older binary.
 

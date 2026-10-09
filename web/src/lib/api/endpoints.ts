@@ -6,11 +6,9 @@ import {
   addressSchema,
   blockPageSchema,
   blockSchema,
-  mempoolSchema,
   miningJobSchema,
   miningJobResponseSchema,
   paymentUriSchema,
-  seedSchema,
   sendQuoteSchema,
   statusSchema,
   transactionSchema,
@@ -35,8 +33,6 @@ export const api = {
   block: (id: string | number) => request(`/blocks/${id}`, blockSchema),
 
   transaction: (txid: string) => request(`/transactions/${txid}`, transactionSchema),
-
-  mempool: () => request('/mempool', mempoolSchema),
 
   address: (address: string) => request(`/addresses/${address}`, addressSchema),
 
@@ -79,18 +75,8 @@ export const api = {
       amount_zatoshi: Number(input.amount_zatoshi),
     }),
 
-  mine: (blocks: number) =>
-    post('/mine', z.object({ blocks: z.number(), hashes: z.array(z.string()) }), { blocks }),
-
   startMining: (blocks: number, idempotency_key: string) =>
     post('/mining/jobs', miningJobSchema, { blocks, idempotency_key }),
 
   miningJob: () => request('/mining/jobs', miningJobResponseSchema),
-
-  miningJobById: (id: string) => request(`/mining/jobs/${encodeURIComponent(id)}`, miningJobSchema),
-
-  seed: () =>
-    post('/dev/seed', seedSchema, {
-      confirmation: 'I understand this seed is for regtest only',
-    }),
 };

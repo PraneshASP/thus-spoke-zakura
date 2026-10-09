@@ -1,3 +1,4 @@
+import { useRef } from 'react';
 import { useMutation, useQueryClient, type UseMutationResult } from '@tanstack/react-query';
 import {
   api,
@@ -25,22 +26,42 @@ function useInvalidateWallet() {
   };
 }
 
-function operationKey<T>(kind: string, fingerprint: (variables: T) => string) {
+function operationKey<T>(
+  kind: string,
+  fingerprint: (variables: T) => string,
+  storageArea = sessionStorage,
+) {
   const storageKey = (variables: T) => `ths:${kind}:${fingerprint(variables)}`;
   return {
+    nameFor: storageKey,
     keyFor(variables: T) {
-      const storage = storageKey(variables);
-      let key = sessionStorage.getItem(storage);
+      const itemKey = storageKey(variables);
+      let key = storageArea.getItem(itemKey);
       if (!key) {
         key = idempotencyKey();
-        sessionStorage.setItem(storage, key);
       }
+      storageArea.setItem(itemKey, key);
       return key;
     },
     clear(variables: T) {
-      sessionStorage.removeItem(storageKey(variables));
+      storageArea.removeItem(storageKey(variables));
+      if (storageArea === localStorage) sessionStorage.removeItem(storageKey(variables));
+    },
+    clearIfMatches(variables: T, expectedKey: string) {
+      const itemKey = storageKey(variables);
+      if (storageArea.getItem(itemKey) === expectedKey) storageArea.removeItem(itemKey);
+      if (storageArea === localStorage && sessionStorage.getItem(itemKey) === expectedKey) {
+        sessionStorage.removeItem(itemKey);
+      }
     },
   };
+}
+
+function withFaucetLock<T>(name: string, action: () => T | Promise<T>): Promise<T> {
+  if (!navigator.locks) {
+    return Promise.reject(new Error('This browser cannot coordinate faucet payments across tabs.'));
+  }
+  return navigator.locks.request(name, action);
 }
 
 /** Exactly one of `to_account` or `to_address` is set. */
@@ -88,28 +109,62 @@ export interface FaucetVariables {
   amount_zatoshi: bigint;
 }
 
-export function useFaucet(): UseMutationResult<Activity, Error, FaucetVariables> {
+type FaucetOperationResult = { activity: Activity; key: string };
+
+export function useFaucet(): UseMutationResult<FaucetOperationResult, Error, FaucetVariables> {
   const invalidate = useInvalidateWallet();
+  const ownedKeys = useRef(new Map<string, string>());
   const operation = operationKey(
     'faucet',
     (variables: FaucetVariables) =>
       `${variables.account_id}:${variables.pool}:${variables.amount_zatoshi}`,
+    localStorage,
   );
   return useMutation({
-    mutationFn: (variables: FaucetVariables) =>
-      api.faucet({ ...variables, idempotency_key: operation.keyFor(variables) }),
-    onSuccess: async (_activity, variables) => {
-      operation.clear(variables);
+    mutationFn: async (variables: FaucetVariables) => {
+      const name = operation.nameFor(variables);
+      const tabName = `${name}:tab`;
+      const key = await withFaucetLock(name, () => {
+        const legacyKey = sessionStorage.getItem(name);
+        const ownedKey = ownedKeys.current.get(name) ?? sessionStorage.getItem(tabName);
+        if (ownedKey) {
+          sessionStorage.setItem(tabName, ownedKey);
+          if (legacyKey !== null) sessionStorage.removeItem(name);
+          ownedKeys.current.set(name, ownedKey);
+          return ownedKey;
+        }
+
+        const sharedKey = localStorage.getItem(name);
+        if (legacyKey) {
+          if (sharedKey === null) localStorage.setItem(name, legacyKey);
+          // Keep the migrated payment with this tab until it sees confirmation.
+          sessionStorage.setItem(tabName, legacyKey);
+          sessionStorage.removeItem(name);
+          ownedKeys.current.set(name, legacyKey);
+          return legacyKey;
+        }
+        if (legacyKey !== null) sessionStorage.removeItem(name);
+
+        const key = sharedKey ?? operation.keyFor(variables);
+        sessionStorage.setItem(tabName, key);
+        ownedKeys.current.set(name, key);
+        return key;
+      });
+      const activity = await api.faucet({ ...variables, idempotency_key: key });
+      return { activity, key };
+    },
+    onSuccess: async ({ activity, key }, variables) => {
+      if (activity.status === 'confirmed') {
+        const name = operation.nameFor(variables);
+        await withFaucetLock(name, () => {
+          operation.clearIfMatches(variables, key);
+          const tabName = `${name}:tab`;
+          if (sessionStorage.getItem(tabName) === key) sessionStorage.removeItem(tabName);
+          if (ownedKeys.current.get(name) === key) ownedKeys.current.delete(name);
+        });
+      }
       await invalidate();
     },
-  });
-}
-
-export function useMine(): UseMutationResult<{ blocks: number }, Error, number> {
-  const invalidate = useInvalidateWallet();
-  return useMutation({
-    mutationFn: (blocks: number) => api.mine(blocks),
-    onSuccess: invalidate,
   });
 }
 

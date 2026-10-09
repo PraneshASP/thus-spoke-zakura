@@ -14,3 +14,13 @@ Object.defineProperty(window, 'matchMedia', {
     removeEventListener: vi.fn(),
   }),
 });
+
+// jsdom has no Web Locks API. Faucet tests replace this with a queued lock when
+// they need to exercise cross-tab ordering.
+Object.defineProperty(window.navigator, 'locks', {
+  configurable: true,
+  value: {
+    request: (name: string, callback: (lock: Lock) => unknown) =>
+      Promise.resolve(callback({ name, mode: 'exclusive' })),
+  },
+});
